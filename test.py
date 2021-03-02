@@ -10,6 +10,8 @@ from Box2D.b2 import (world, polygonShape, circleShape, staticBody, dynamicBody,
 
 import math
 
+from collections import defaultdict
+
 # --- constants ---
 # Box2D deals with meters, but we want to display pixels,
 # so define a conversion factor:
@@ -29,7 +31,8 @@ ROBO_LEN = 0.13
 
 TEAM1_COLOR = (255, 255, 127, 255)
 TEAM2_COLOR = (127, 255, 255, 255)
-
+RED_CORE_COLOR = (255, 128, 128, 255)
+GREEN_CORE_COLOR = (128, 255, 128, 255)
 
 red_core_coords=[
     (ARENA_WIDTH/2.0, 0.3),
@@ -48,8 +51,14 @@ green_core_coords=[
 def vec_add(a,b):
     return (a[0] + b[0], a[1] + b[1])
 
+def vec_sub(a,b):
+    return (a[0] - b[0], a[1] - b[1])
+
 def vec_mul(a, b):
     return (a[0] * b, a[1] * b)
+
+def vec_dot(a,b):
+    return a[0]*b[0]+a[1]*b[1]
 
 def vec_len(a):
     return math.sqrt(a[0]*a[0] + a[1]*a[1])
@@ -59,6 +68,9 @@ def vec_normalize(a):
 
 def vec_move(orig, dir, amount):
     return vec_add(orig, vec_mul(vec_normalize(dir), amount))
+
+def vec_projectOn(on, vec):
+    return vec_dot(vec, vec_normalize(on))
 
 robo_coords=[
     (vec_move(vec_move((0.40, ARENA_HEIGHT), (-1.0,-1.0), 0.1 + ROBO_WIDTH/2.0),
@@ -72,7 +84,7 @@ robo_coords=[
 ]
 # --- pygame setup ---
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), 0, 32)
-pygame.display.set_caption('Simple pygame example')
+pygame.display.set_caption('RobotUprising sim')
 clock = pygame.time.Clock()
 
 # --- pybox2d world setup ---
@@ -114,14 +126,14 @@ red_cores = [ world.CreateDynamicBody(position=pos) for pos in red_core_coords]
 for body in red_cores:
     circle = body.CreateCircleFixture(radius=0.036,
         density=0.2, friction=0.3, restitution=0.6,
-        userData = (255, 128, 128, 255))
+        userData = RED_CORE_COLOR)
     body.linearDamping = 1.1
 
 green_cores = [ world.CreateDynamicBody(position=pos) for pos in green_core_coords]
 for body in green_cores:
     circle = body.CreateCircleFixture(radius=0.036,
         density=0.2, friction=0.3, restitution=0.6,
-        userData = (128, 255, 128, 255))
+        userData = GREEN_CORE_COLOR)
     body.linearDamping = 1.1
 
 robots = [world.CreateDynamicBody(position=coord[0], angle=coord[1]) for coord in robo_coords]
@@ -228,6 +240,60 @@ class NullController:
     def getControls(self):
         return 0.0,0.0
 
+def categorize(func, seq):
+    """Return mapping from categories to lists
+    of categorized items.
+    """
+    d = defaultdict(list)
+    for item in seq:
+        d[func(item)].append(item)
+    return d
+
+def goal_state(core):
+    det = vec_dot((1.0, -1.0), vec_sub(core.position, (0.0, ARENA_HEIGHT)))
+    if det < 0.4:
+        return 1
+    if det > (ARENA_HEIGHT + ARENA_WIDTH - 0.4):
+        return 2
+    return 0
+
+
+scores = [0,0]
+red_core_counts = [0,0]
+
+def apply_rules(world, red_cores, green_cores, scores, red_core_counts):
+    in_goals = categorize(goal_state, red_cores)
+    red_cores[:] = in_goals[0]
+    scores[0] -= len(in_goals[1])
+    scores[1] -= len(in_goals[2])
+    red_core_counts[0] += len(in_goals[1])
+    red_core_counts[1] += len(in_goals[2])
+    for x in in_goals[1]:
+        world.DestroyBody(x)
+    for x in in_goals[2]:
+        world.DestroyBody(x)
+    
+    if red_core_counts[0] >= 3:
+        return 2
+    if red_core_counts[1] >= 3:
+        return 1
+    
+    in_goals = categorize(goal_state, green_cores)
+    green_cores[:] = in_goals[0]
+    scores[0] += len(in_goals[1])
+    scores[1] += len(in_goals[2])   
+    for x in in_goals[1]:
+        world.DestroyBody(x)
+    for x in in_goals[2]:
+        world.DestroyBody(x)
+
+    if len(green_cores) == 0 and len(red_cores) == 0:
+        if scores[0] > scores[1]:
+            return 1
+        if scores[0] < scores[1]:
+            return 2
+    return 0
+
 console = Console()
 
 controllers=[ NullController(), NullController(), NullController(),console]
@@ -247,6 +313,9 @@ while running:
         steer(robot, left_vel, right_vel)        
     screen.fill((0, 0, 0, 0))
     draw_bases()
+    apply_rules(world, red_cores, green_cores, scores, red_core_counts)
+    pygame.display.set_caption('RobotUprising score:{} - {}, reds {} - {}'\
+        .format(scores[0], scores[1], red_core_counts[0], red_core_counts[1]))
     # Draw the world
     for body in world.bodies:
         for fixture in body.fixtures:
