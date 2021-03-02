@@ -12,6 +12,8 @@ import math
 
 from collections import defaultdict
 
+from bots.simple import SimpleBot, SimpleBot2, SimpleBot3
+
 # --- constants ---
 # Box2D deals with meters, but we want to display pixels,
 # so define a conversion factor:
@@ -228,16 +230,16 @@ class Console:
             self.turn = 0.0
         if event.type == KEYUP and event.key == K_RIGHT:
             self.turn = 0.0
-    def getControls(self):
+    def getControls(self, *args):
         left_vel = (self.vel - self.turn)
         right_vel = (self.vel + self.turn)
-        scale = MAX_VEL/max(abs(left_vel), abs(right_vel), 1.0)
+        scale = 1.0/max(abs(left_vel), abs(right_vel), 1.0)
         left_vel *= scale
         right_vel *= scale
         return left_vel,right_vel
 
 class NullController:
-    def getControls(self):
+    def getControls(self, *args):
         return 0.0,0.0
 
 def categorize(func, seq):
@@ -296,11 +298,20 @@ def apply_rules(world, red_cores, green_cores, scores, red_core_counts):
 
 console = Console()
 
-controllers=[ NullController(), NullController(), NullController(),console]
+controllers=[ SimpleBot2(0), SimpleBot2(1), SimpleBot3(2),SimpleBot3(3)]
+#controllers=[ SimpleBot(0), SimpleBot(1), NullController(),NullController()]
 # --- main game loop ---
-running = True
 vel = 0
 turn = 0
+running = False
+
+while not running:
+    # Check the event queue
+    for event in pygame.event.get():
+        if event.type == QUIT or (event.type == KEYDOWN and event.key == K_UP):
+            # The user closed the window or pressed escape
+            running = True
+
 while running:
     # Check the event queue
     for event in pygame.event.get():
@@ -308,9 +319,12 @@ while running:
             # The user closed the window or pressed escape
             running = False
         console.handleEvent(event)
+    red_coords=[core.position for core in red_cores]
+    green_coords=[core.position for core in green_cores]
+    bot_coords=[(bot.position, bot.angle) for bot in robots]
     for robot, controller in zip(robots, controllers):
-        left_vel, right_vel = controller.getControls()
-        steer(robot, left_vel, right_vel)        
+        left_vel, right_vel = controller.getControls(bot_coords, green_coords, red_coords)
+        steer(robot, left_vel * MAX_VEL, right_vel * MAX_VEL)        
     screen.fill((0, 0, 0, 0))
     draw_bases()
     apply_rules(world, red_cores, green_cores, scores, red_core_counts)
