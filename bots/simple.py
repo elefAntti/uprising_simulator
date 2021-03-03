@@ -172,9 +172,10 @@ class SimpleBot3:
             return (-1.0, 1.0)
     def getWaitPosition(self):
         if self._index < 2:
-            return (0.4, 1.1)
+            return max((0.1, 0.8), (0.7, 1.4), key = vec_distTo(self.partner_coords))
         else:
-            return (0.4, 1.1)
+            return max((0.8, 0.1), (1.4, 0.7), key = vec_distTo(self.partner_coords))
+
     def getPartnerIndex(self):
         return [1,0,3,2][self._index]
     def score(self, target):
@@ -198,7 +199,9 @@ class SimpleBot3:
         else:
             own_base_dist_green -= 0.5
         possible_red = [x for x in red_coords if vec_dist(self.getBaseCoords(), x) > own_base_dist]
+        possible_red = [x for x in possible_red if vec_dist(self.partner_coords, x) > 0.3]
         possible_green = [x for x in green_coords if vec_dist(self.getBaseCoords(), x) < own_base_dist_green]
+        possible_green = [x for x in possible_green if vec_dist(self.partner_coords, x) > 0.3]
         target = self.getWaitPosition()
         if len(red_coords) == 0:
             target = (target[1], target[0])

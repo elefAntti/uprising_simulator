@@ -328,7 +328,7 @@ def apply_rules(world, red_cores, green_cores, scores, red_core_counts):
 
 console = Console()
 
-controllers=[SimpleBot2(0), SimpleBot2(1), SimpleBot3(2), SimpleBot3(3)]
+controllers=[SimpleBot3(0), SimpleBot3(1), SimpleBot(2), SimpleBot(3)]
 #controllers=[ NullController(),  NullController(),console,NullController()]
 # --- main game loop ---
 vel = 0
