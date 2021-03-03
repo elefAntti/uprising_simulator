@@ -48,6 +48,13 @@ def bots_closer_than(pos, bots, dist):
 def other_bots(bots, own_idx):
     return [x for i,x in enumerate(bots) if i != own_idx]
 
+def normalize_angle(angle):
+    if angle > math.pi:
+        return angle - 2.0*math.pi
+    if angle < -math.pi:
+        return angle + 2.0*math.pi  
+    return angle
+
 class SimpleBot:
     def __init__(self, index):
         self._index=index
@@ -84,7 +91,7 @@ class SimpleBot:
         else:
             self._goingToBase = True
         to_target = vec_sub(target, own_coords)
-        turn = vec_angle(to_target) - own_dir
+        turn = normalize_angle(vec_angle(to_target) - own_dir)
 
         if abs(turn) < 0.1:
             return 1.0, 1.0
@@ -139,7 +146,7 @@ class SimpleBot2:
             self._goingToBase = True
         
         to_target = vec_sub(target, self.own_coords)
-        turn = vec_angle(to_target) - own_dir
+        turn = normalize_angle(vec_angle(to_target) - own_dir)
 
         if abs(turn) < 0.1:
             return 1.0, 1.0
@@ -205,7 +212,7 @@ class SimpleBot3:
             self._goingToBase = True
         
         to_target = vec_sub(target, self.own_coords)
-        turn = vec_angle(to_target) - own_dir
+        turn = normalize_angle(vec_angle(to_target) - own_dir)
 
         if abs(turn) < 0.1:
             return 1.0, 1.0
