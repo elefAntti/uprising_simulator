@@ -39,6 +39,12 @@ def vec_dist(a, b):
 def vec_distTo(a):
     return lambda b: vec_dist(a,b)
 
+def vec_90deg(a):
+    return -a[1], a[0]
+
+def vec_mix(a,b, ratio):
+    return vec_add(vec_mul(a, (1.0 - ratio)), vec_mul(b, ratio))
+
 def dist_to_neutral_corner(pos):
     return min(vec_dist((0.0, 0.0), pos), vec_dist((1.5, 1.5), pos))
 
@@ -48,6 +54,9 @@ def bots_closer_than(pos, bots, dist):
 def other_bots(bots, own_idx):
     return [x for i,x in enumerate(bots) if i != own_idx]
 
+def clamp(val, minimum, maximum):
+    return min(max(val, minimum), maximum)
+
 def normalize_angle(angle):
     if angle > math.pi:
         return angle - 2.0*math.pi
@@ -55,15 +64,46 @@ def normalize_angle(angle):
         return angle + 2.0*math.pi  
     return angle
 
+def steer_to_target(own_coords, own_dir, target):
+    to_target = vec_sub(target, own_coords)
+    turn = normalize_angle(vec_angle(to_target) - own_dir)
+
+    if abs(turn) < 0.1:
+        return 1.0, 1.0
+    if turn < 0.0:
+        return 1.0, -1.0
+    else:
+        return -1.0, 1.0
+
+def steer_to_target2(own_coords, own_dir, target):
+    to_target = vec_sub(target, own_coords)
+    turn = normalize_angle(vec_angle(to_target) - own_dir)
+    turn2 = normalize_angle(vec_angle(to_target) - own_dir + math.pi)
+    fw = (1.0, 1.0)
+    if abs(turn2) < abs(turn):
+        turn = turn2
+        fw = (-1.0, -1.0)
+    ratio = min(abs(turn) / 0.1, 1.0)
+    turning = (-1.0, 1.0)
+    if turn < 0.0:
+        turning = (1.0, -1.0)
+    ratio2 = min(vec_len(to_target) / 0.02, 1.0)
+    return vec_mul(vec_mix(fw, turning, ratio), ratio2)
+
+def get_base_coords(bot_index):
+    if bot_index < 2:
+        return (0.0, 1.5)
+    else:
+        return (1.5, 0.0)
+
+def point_in_arena(point):
+    return point[0] >= 0.0 and point[0] <= 1.5 \
+        and point[1] >= 0.0 and point[1] <= 1.5 
+
 class SimpleBot:
     def __init__(self, index):
         self._index=index
         self._goingToBase = False
-    def getBaseCoords(self):
-        if self._index < 2:
-            return (0.0, 1.5)
-        else:
-            return (1.5, 0.0)
     def getWaitPosition(self):
         if self._index < 2:
             return (0.4, 1.1)
@@ -72,13 +112,13 @@ class SimpleBot:
     def getControls(self, bot_coords, green_coords, red_coords):
         own_coords = bot_coords[self._index][0]
         own_dir = bot_coords[self._index][1]
-        own_base_dist = vec_dist(self.getBaseCoords(), own_coords)
+        own_base_dist = vec_dist(get_base_coords(self._index), own_coords)
         if self._goingToBase:
             own_base_dist += 0.5
         else:
             pass
-        possible_red = [x for x in red_coords if vec_dist(self.getBaseCoords(), x) > own_base_dist]
-        possible_green = [x for x in green_coords if vec_dist(self.getBaseCoords(), x) < own_base_dist]
+        possible_red = [x for x in red_coords if vec_dist(get_base_coords(self._index), x) > own_base_dist]
+        possible_green = [x for x in green_coords if vec_dist(get_base_coords(self._index), x) < own_base_dist]
         target = self.getWaitPosition()
         if len(red_coords) == 0:
             target = (target[1], target[0])
@@ -90,15 +130,7 @@ class SimpleBot:
             self._goingToBase = True
         else:
             self._goingToBase = True
-        to_target = vec_sub(target, own_coords)
-        turn = normalize_angle(vec_angle(to_target) - own_dir)
-
-        if abs(turn) < 0.1:
-            return 1.0, 1.0
-        if turn < 0.0:
-            return 1.0, -1.0
-        else:
-            return -1.0, 1.0
+        return steer_to_target(own_coords, own_dir, target)
 
 
 class SimpleBot2:
@@ -145,15 +177,7 @@ class SimpleBot2:
         else:
             self._goingToBase = True
         
-        to_target = vec_sub(target, self.own_coords)
-        turn = normalize_angle(vec_angle(to_target) - own_dir)
-
-        if abs(turn) < 0.1:
-            return 1.0, 1.0
-        if turn < 0.0:
-            return 1.0, -1.0
-        else:
-            return -1.0, 1.0
+        return steer_to_target(self.own_coords, own_dir, target)
 
 class SimpleBot3:
     def __init__(self, index):
@@ -214,12 +238,20 @@ class SimpleBot3:
         else:
             self._goingToBase = True
         
-        to_target = vec_sub(target, self.own_coords)
-        turn = normalize_angle(vec_angle(to_target) - own_dir)
+        return steer_to_target(self.own_coords, own_dir, target)
 
-        if abs(turn) < 0.1:
-            return 1.0, 1.0
-        if turn < 0.0:
-            return 1.0, -1.0
-        else:
-            return -1.0, 1.0
+class Goalie:
+    def __init__(self, index):
+        self._index=index
+        self._own_base = get_base_coords(self._index)
+        self._attack_dir = vec_normalize(vec_sub((0.75, 0.75), self._own_base))
+        self._post = vec_add(self._own_base, vec_mul(self._attack_dir, 0.44))
+    def getControls(self, bot_coords, green_coords, red_coords):
+        own_coords = bot_coords[self._index][0]
+        own_dir = bot_coords[self._index][1]
+        x_dir = vec_90deg(self._attack_dir)
+        closest_red = min(red_coords, key=vec_distTo(self._own_base))
+        t = vec_dot(vec_sub(closest_red, self._post), x_dir)
+        t = clamp(t, -.3, .3)
+        target = vec_add(self._post, vec_mul(x_dir, t))
+        return steer_to_target2(own_coords, own_dir, target)
