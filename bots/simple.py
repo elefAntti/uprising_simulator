@@ -84,7 +84,7 @@ class SimpleBot:
         else:
             self._goingToBase = True
         to_target = vec_sub(target, own_coords)
-        turn = vec_angle(to_target) - own_dir - math.pi/2.0
+        turn = vec_angle(to_target) - own_dir
 
         if abs(turn) < 0.1:
             return 1.0, 1.0
@@ -139,7 +139,7 @@ class SimpleBot2:
             self._goingToBase = True
         
         to_target = vec_sub(target, self.own_coords)
-        turn = vec_angle(to_target) - own_dir - math.pi/2.0
+        turn = vec_angle(to_target) - own_dir
 
         if abs(turn) < 0.1:
             return 1.0, 1.0
@@ -205,7 +205,7 @@ class SimpleBot3:
             self._goingToBase = True
         
         to_target = vec_sub(target, self.own_coords)
-        turn = vec_angle(to_target) - own_dir - math.pi/2.0
+        turn = vec_angle(to_target) - own_dir
 
         if abs(turn) < 0.1:
             return 1.0, 1.0

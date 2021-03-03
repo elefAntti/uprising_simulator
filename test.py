@@ -76,13 +76,13 @@ def vec_projectOn(on, vec):
 
 robo_coords=[
     (vec_move(vec_move((0.40, ARENA_HEIGHT), (-1.0,-1.0), 0.1 + ROBO_WIDTH/2.0),
-        (1.0,-1.0), ROBO_LEN/2.0), -math.pi*3.0/4.0),
+        (1.0,-1.0), ROBO_LEN/2.0), -math.pi/4.0),
     (vec_move(vec_move((0.0, ARENA_HEIGHT - 0.40), (1.0,1.0), 0.1 + ROBO_WIDTH/2.0),
-        (1.0,-1.0), ROBO_LEN/2.0), -math.pi*3.0/4.0),
+        (1.0,-1.0), ROBO_LEN/2.0), -math.pi/4.0),
     (vec_move(vec_move((ARENA_WIDTH - 0.40, 0.0), (1.0, 1.0), 0.1 + ROBO_WIDTH/2.0),
-        (-1.0,1.0), ROBO_LEN/2.0), math.pi/4.0),
+        (-1.0,1.0), ROBO_LEN/2.0), math.pi*3.0/4.0),
     (vec_move(vec_move((ARENA_WIDTH, 0.40), (-1.0, -1.0), 0.1 + ROBO_WIDTH/2.0),
-        (-1.0,1.0), ROBO_LEN/2.0), math.pi/4.0)
+        (-1.0,1.0), ROBO_LEN/2.0), math.pi*3.0/4.0)
 ]
 # --- pygame setup ---
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), 0, 32)
@@ -140,7 +140,7 @@ for body in green_cores:
 
 robots = [world.CreateDynamicBody(position=coord[0], angle=coord[1]) for coord in robo_coords]
 for body in robots:
-    body.CreatePolygonFixture(box=(ROBO_WIDTH/2.0, ROBO_LEN/2.0), density=3, friction=0.3)
+    body.CreatePolygonFixture(box=(ROBO_LEN/2.0, ROBO_WIDTH/2.0), density=3, friction=0.3)
     body.angularDamping = 100.0
 
 robots[0].fixtures[0].userData = TEAM1_COLOR
@@ -192,7 +192,7 @@ def draw_bases():
         TEAM2_COLOR)
 
 def steer_point(body, point, speed):
-    forward = body.GetWorldVector((0,1))
+    forward = body.GetWorldVector((1,0))
     velocity = body.GetLinearVelocityFromWorldPoint(point)
     currentSpeed = dot(velocity, forward)
     err = currentSpeed - speed
@@ -201,10 +201,10 @@ def steer_point(body, point, speed):
 
 def steer(body, left_speed, right_speed):
     
-    steer_point(body, body.GetWorldPoint((-0.05, 0)), left_speed)
-    steer_point(body, body.GetWorldPoint((0.05, 0)), right_speed)
+    steer_point(body, body.GetWorldPoint((0.0,0.05)), left_speed)
+    steer_point(body, body.GetWorldPoint((0.0,-0.05)), right_speed)
 
-    side = body.GetWorldVector((1,0))
+    side = body.GetWorldVector((0,1))
     transSpeed = dot(body.linearVelocity, side)
     impulse=-transSpeed*body.mass*side
     body.ApplyLinearImpulse(impulse=impulse, point=body.position, wake=False)
@@ -299,18 +299,11 @@ def apply_rules(world, red_cores, green_cores, scores, red_core_counts):
 console = Console()
 
 controllers=[ SimpleBot2(0), SimpleBot2(1), SimpleBot3(2),SimpleBot3(3)]
-#controllers=[ SimpleBot(0), SimpleBot(1), NullController(),NullController()]
+#controllers=[ NullController(),  NullController(),console,NullController()]
 # --- main game loop ---
 vel = 0
 turn = 0
-running = False
-
-while not running:
-    # Check the event queue
-    for event in pygame.event.get():
-        if event.type == QUIT or (event.type == KEYDOWN and event.key == K_UP):
-            # The user closed the window or pressed escape
-            running = True
+running = True
 
 while running:
     # Check the event queue
