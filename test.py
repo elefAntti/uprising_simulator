@@ -35,6 +35,10 @@ TEAM1_COLOR = (255, 255, 127, 255)
 TEAM2_COLOR = (127, 255, 255, 255)
 RED_CORE_COLOR = (255, 128, 128, 255)
 GREEN_CORE_COLOR = (128, 255, 128, 255)
+pygame.font.init()
+fontname = pygame.font.match_font('arial')
+font = pygame.font.Font(fontname, 24)
+big_font = pygame.font.Font(fontname, 48)
 
 red_core_coords=[
     (ARENA_WIDTH/2.0, 0.3),
@@ -191,6 +195,30 @@ def draw_bases():
         (ARENA_WIDTH, 0.40)],
         TEAM2_COLOR)
 
+def draw_scores():
+    message='score: {} reds: {}'.format(scores[0], red_core_counts[0])
+    msg_pic=font.render(message, False, TEAM1_COLOR)
+    screen.blit(msg_pic,(150,20))
+    message='score: {} reds: {}'.format(scores[1], red_core_counts[1])
+    msg_pic=font.render(message, False, TEAM2_COLOR)
+    screen.blit(msg_pic,(150, SCREEN_HEIGHT - 50))
+
+def draw_winner(winner):
+    color = (128,128,128,255)
+    message = "Draw"
+    if winner == 1:
+        color = TEAM1_COLOR
+        message = "Team 1 won"
+
+    if winner == 2:
+        color = TEAM2_COLOR
+        message = "Team 2 won"
+
+    msg_pic=big_font.render(message, False, color)
+    screen.blit(msg_pic,(100, SCREEN_HEIGHT/2 - 50)) 
+
+
+
 def steer_point(body, point, speed):
     forward = body.GetWorldVector((1,0))
     velocity = body.GetLinearVelocityFromWorldPoint(point)
@@ -276,9 +304,9 @@ def apply_rules(world, red_cores, green_cores, scores, red_core_counts):
         world.DestroyBody(x)
     
     if red_core_counts[0] >= 3:
-        return 2
+        return True, 2
     if red_core_counts[1] >= 3:
-        return 1
+        return True, 1
     
     in_goals = categorize(goal_state, green_cores)
     green_cores[:] = in_goals[0]
@@ -291,21 +319,25 @@ def apply_rules(world, red_cores, green_cores, scores, red_core_counts):
 
     if len(green_cores) == 0 and len(red_cores) == 0:
         if scores[0] > scores[1]:
-            return 1
+            return True, 1
         if scores[0] < scores[1]:
-            return 2
-    return 0
+            return True, 2
+        return True, 0
+        
+    return False, 0
 
 console = Console()
 
-controllers=[ SimpleBot2(0), SimpleBot2(1), SimpleBot3(2),SimpleBot3(3)]
+controllers=[SimpleBot2(0), SimpleBot2(1), SimpleBot3(2), SimpleBot3(3)]
 #controllers=[ NullController(),  NullController(),console,NullController()]
 # --- main game loop ---
 vel = 0
 turn = 0
 running = True
+finished = False
+winner = 0
 
-while running:
+while running and not finished:
     # Check the event queue
     for event in pygame.event.get():
         if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
@@ -320,9 +352,8 @@ while running:
         steer(robot, left_vel * MAX_VEL, right_vel * MAX_VEL)        
     screen.fill((0, 0, 0, 0))
     draw_bases()
-    apply_rules(world, red_cores, green_cores, scores, red_core_counts)
-    pygame.display.set_caption('RobotUprising score:{} - {}, reds {} - {}'\
-        .format(scores[0], scores[1], red_core_counts[0], red_core_counts[1]))
+    finished, winner = apply_rules(world, red_cores, green_cores, scores, red_core_counts)
+    draw_scores()
     # Draw the world
     for body in world.bodies:
         for fixture in body.fixtures:
@@ -334,4 +365,19 @@ while running:
     pygame.display.flip()
     clock.tick(TARGET_FPS)
 
+while running:
+    for event in pygame.event.get():
+        if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
+            # The user closed the window or pressed escape
+            running = False
+    screen.fill((0, 0, 0, 0))
+    draw_bases()
+    # Draw the world
+    for body in world.bodies:
+        for fixture in body.fixtures:
+            fixture.shape.draw(body, fixture)
+    draw_scores()
+    draw_winner(winner)
+    pygame.display.flip()
+    clock.tick(TARGET_FPS)
 pygame.quit()
