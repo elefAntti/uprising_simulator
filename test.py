@@ -1,5 +1,48 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+Simulate the game played at RobotUprising hackathon
+
+Two teams of robots (differential drive with tracks) compete in an arena,
+their position and the position of energy cores (balls) are tracked from top using machine vision.
+
+There are two bots per team, the objective is to push the red balls to opponents corner and
+green balls to your own corner. If a player gets three green balls in their corner, they lose.
+Otherwise the game ends as all the balls have been scored or after a time limit (not implemented yet)
+
+In the bots.simple module there are couple of simple test programs to play against.
+You can select "Human" as the player to control that bot with arrow keys.
+
+Other controls:
+    ESC Quit
+    SPACE pause
+    ENTER reset
+
+Author: Antti Valli (https://github.com/elefAntti)
+Released under BSD 2-clause licence
+
+Copyright (c) 2021, Antti Valli
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE."""
+
 
 import pygame
 from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_UP, K_DOWN, K_LEFT, K_RIGHT, K_RETURN, K_SPACE)
@@ -13,6 +56,7 @@ import bots.simple
 import bots.human
 from bots import bot_type, keyboard_listeners
 
+#Use this to select the bots
 player_names = ["SimpleBot2", "Human", "Prioritiser2", "Prioritiser2"]
 
 SCREEN_WIDTH, SCREEN_HEIGHT = int((ARENA_WIDTH + 2.0*MARGIN)*PPM), int((ARENA_HEIGHT + 2.0*MARGIN)*PPM)
@@ -28,7 +72,7 @@ font = pygame.font.Font(fontname, 24)
 big_font = pygame.font.Font(fontname, 48)
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), 0, 32)
-pygame.display.set_caption('RobotUprising sim')
+pygame.display.set_caption('Uprising simulator')
 clock = pygame.time.Clock()
 
 def to_screen_coords(position):
@@ -45,8 +89,6 @@ def my_draw_circle(circle, body, fixture):
     position = to_screen_coords(body.transform * circle.pos)
     pygame.draw.circle(screen, fixture.userData, [int(
         x) for x in position], int(circle.radius * PPM))
-    # Note: Python 3.x will enforce that pygame get the integers it requests,
-    #       and it will not convert from float.
 circleShape.draw = my_draw_circle
 
 def draw_polygon(vertices, color):
@@ -100,7 +142,6 @@ def create_controllers():
 
 controllers=create_controllers()
 
-# --- main game loop ---
 running = True
 finished = False
 paused = False
