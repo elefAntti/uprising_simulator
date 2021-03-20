@@ -9,7 +9,11 @@ import math
 import Box2D
 from Box2D.b2 import (polygonShape, circleShape, staticBody, dynamicBody)
 from simulator import Simulator
-from bots.simple import SimpleBot, SimpleBot2, SimpleBot3, Prioritiser2, Prioritiser
+import bots.simple
+import bots.human
+from bots import bot_type, keyboard_listeners
+
+player_names = ["SimpleBot2", "Human", "Prioritiser2", "Prioritiser2"]
 
 SCREEN_WIDTH, SCREEN_HEIGHT = int((ARENA_WIDTH + 2.0*MARGIN)*PPM), int((ARENA_HEIGHT + 2.0*MARGIN)*PPM)
 
@@ -82,35 +86,6 @@ def draw_info(message):
     msg_pic=big_font.render(message, False, color)
     screen.blit(msg_pic,(100, SCREEN_HEIGHT/2 - 50)) 
 
-class Console:
-    def __init__(self):
-        self.vel = 0.0
-        self.turn = 0.0
-    def handleEvent(self, event):
-        if (event.type == KEYDOWN and event.key == K_UP):
-            self.vel = 1.0
-        if (event.type == KEYDOWN and event.key == K_DOWN):
-            self.vel = -1.0
-        if event.type == KEYUP and event.key == K_UP:
-            self.vel = 0.0
-        if event.type == KEYUP and event.key == K_DOWN:
-            self.vel = 0.0
-        if (event.type == KEYDOWN and event.key == K_LEFT):
-            self.turn = 1.0
-        if (event.type == KEYDOWN and event.key == K_RIGHT):
-            self.turn = -1.0
-        if event.type == KEYUP and event.key == K_LEFT:
-            self.turn = 0.0
-        if event.type == KEYUP and event.key == K_RIGHT:
-            self.turn = 0.0
-    def getControls(self, *args):
-        left_vel = (self.vel - self.turn)
-        right_vel = (self.vel + self.turn)
-        scale = 1.0/max(abs(left_vel), abs(right_vel), 1.0)
-        left_vel *= scale
-        right_vel *= scale
-        return left_vel,right_vel
-
 def draw_scores(scores, red_core_counts):
     message='score: {} reds: {}'.format(scores[0], red_core_counts[0])
     msg_pic=font.render(message, False, TEAM1_COLOR)
@@ -119,9 +94,11 @@ def draw_scores(scores, red_core_counts):
     msg_pic=font.render(message, False, TEAM2_COLOR)
     screen.blit(msg_pic,(150, SCREEN_HEIGHT - 50))
 
-console = Console()
+def create_controllers():
+    keyboard_listeners.clear()
+    return [bot_type[player_names[i]](i) for i in range(4)]
 
-controllers=[SimpleBot2(0), console, Prioritiser2(2), Prioritiser2(3)]
+controllers=create_controllers()
 
 # --- main game loop ---
 running = True
@@ -136,10 +113,12 @@ while running:
         if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
             running = False
         if event.type == KEYDOWN and event.key == K_RETURN:
+            controllers=create_controllers()
             simulator.init(controllers)
         if event.type == KEYDOWN and event.key == K_SPACE:
             paused = not paused
-        console.handleEvent(event)
+        for listener in keyboard_listeners:
+            listener.handle_event(event)
     if not paused:
         simulator.update()
     finished = simulator.is_game_over()

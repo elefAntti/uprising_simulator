@@ -140,7 +140,7 @@ class Simulator:
         green_coords=[core.position for core in self.green_cores]
         bot_coords=[(bot.position, bot.angle) for bot in self.robots]
         for robot, controller in zip(self.robots, self.controllers):
-            left_vel, right_vel = controller.getControls(bot_coords, green_coords, red_coords)
+            left_vel, right_vel = controller.get_controls(bot_coords, green_coords, red_coords)
             steer(robot, left_vel * MAX_VEL, right_vel * MAX_VEL)
     def step_physics(self):
         self.world.Step(TIME_STEP, 10, 10)

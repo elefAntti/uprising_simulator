@@ -1,7 +1,7 @@
 from vec2d import *
 
 PPM = 300.0  # pixels per meter
-T_SCALE = 4.0
+T_SCALE = 4.0 # Required hack so balls don't stick to walls 
 TARGET_FPS = 60
 TIME_STEP = 1.0 / TARGET_FPS / T_SCALE
 ARENA_WIDTH, ARENA_HEIGHT = 1.5, 1.5
