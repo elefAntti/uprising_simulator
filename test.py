@@ -12,7 +12,7 @@ import math
 
 from collections import defaultdict
 
-from bots.simple import SimpleBot, SimpleBot2, SimpleBot3
+from bots.simple import SimpleBot, SimpleBot2, SimpleBot3, Prioritiser2, Prioritiser
 
 # --- constants ---
 # Box2D deals with meters, but we want to display pixels,
@@ -54,6 +54,11 @@ green_core_coords=[
     (ARENA_WIDTH - 0.15, ARENA_HEIGHT - 0.15),
 ]
 
+colors = {
+    staticBody: (255, 255, 255, 255),
+    dynamicBody: (127, 127, 127, 255),
+}
+
 def vec_add(a,b):
     return (a[0] + b[0], a[1] + b[1])
 
@@ -94,70 +99,6 @@ pygame.display.set_caption('RobotUprising sim')
 clock = pygame.time.Clock()
 
 # --- pybox2d world setup ---
-# Create the world
-world = world(gravity=(0, 0), doSleep=True)
-
-# And a static body to hold the ground shape
-walls = [
-    world.CreateStaticBody(
-        position=(0, -MARGIN),
-        shapes=polygonShape(box=(ARENA_WIDTH + MARGIN, MARGIN)),
-    ),
-    world.CreateStaticBody(
-        position=(0, ARENA_HEIGHT+MARGIN),
-        shapes=polygonShape(box=(ARENA_WIDTH + MARGIN, MARGIN)),
-    ),
-    world.CreateStaticBody(
-        position=(ARENA_WIDTH+MARGIN, 0),
-        shapes=polygonShape(box=(MARGIN, ARENA_HEIGHT)),
-    ),
-    world.CreateStaticBody(
-        position=(-MARGIN, 0),
-        shapes=polygonShape(box=(MARGIN, ARENA_HEIGHT)),
-    ),
-    world.CreateStaticBody(
-        position=(0.0, 0.0),
-        angle = math.pi/4.0,
-        shapes=polygonShape(box=(0.05, 0.05)),
-    ),
-    world.CreateStaticBody(
-        position=(ARENA_WIDTH, ARENA_HEIGHT),
-        angle = math.pi/4.0,
-        shapes=polygonShape(box=(0.05, 0.05)),
-    )
-]
-
-# Create a couple dynamic bodies
-red_cores = [ world.CreateDynamicBody(position=pos) for pos in red_core_coords]
-for body in red_cores:
-    circle = body.CreateCircleFixture(radius=0.036,
-        density=0.2, friction=0.3, restitution=0.6,
-        userData = RED_CORE_COLOR)
-    body.linearDamping = 1.1
-
-green_cores = [ world.CreateDynamicBody(position=pos) for pos in green_core_coords]
-for body in green_cores:
-    circle = body.CreateCircleFixture(radius=0.036,
-        density=0.2, friction=0.3, restitution=0.6,
-        userData = GREEN_CORE_COLOR)
-    body.linearDamping = 1.1
-
-robots = [world.CreateDynamicBody(position=coord[0], angle=coord[1]) for coord in robo_coords]
-for body in robots:
-    body.CreatePolygonFixture(box=(ROBO_LEN/2.0, ROBO_WIDTH/2.0), density=3, friction=0.3)
-    body.angularDamping = 100.0
-
-robots[0].fixtures[0].userData = TEAM1_COLOR
-robots[1].fixtures[0].userData = TEAM1_COLOR
-robots[2].fixtures[0].userData = TEAM2_COLOR
-robots[3].fixtures[0].userData = TEAM2_COLOR
-
-colors = {
-    staticBody: (255, 255, 255, 255),
-    dynamicBody: (127, 127, 127, 255),
-}
-
-# Let's play with extending the shape classes to draw for us.
 
 def to_screen_coords(position):
     return ((position[0] + MARGIN) * PPM, SCREEN_HEIGHT - (position[1] + MARGIN) * PPM)
@@ -194,14 +135,6 @@ def draw_bases():
         (ARENA_WIDTH, 0.41),
         (ARENA_WIDTH, 0.40)],
         TEAM2_COLOR)
-
-def draw_scores():
-    message='score: {} reds: {}'.format(scores[0], red_core_counts[0])
-    msg_pic=font.render(message, False, TEAM1_COLOR)
-    screen.blit(msg_pic,(150,20))
-    message='score: {} reds: {}'.format(scores[1], red_core_counts[1])
-    msg_pic=font.render(message, False, TEAM2_COLOR)
-    screen.blit(msg_pic,(150, SCREEN_HEIGHT - 50))
 
 def draw_winner(winner):
     color = (128,128,128,255)
@@ -287,48 +220,113 @@ def goal_state(core):
         return 2
     return 0
 
+def draw_scores(scores, red_core_counts):
+    message='score: {} reds: {}'.format(scores[0], red_core_counts[0])
+    msg_pic=font.render(message, False, TEAM1_COLOR)
+    screen.blit(msg_pic,(150,20))
+    message='score: {} reds: {}'.format(scores[1], red_core_counts[1])
+    msg_pic=font.render(message, False, TEAM2_COLOR)
+    screen.blit(msg_pic,(150, SCREEN_HEIGHT - 50))
 
-scores = [0,0]
-red_core_counts = [0,0]
 
-def apply_rules(world, red_cores, green_cores, scores, red_core_counts):
-    in_goals = categorize(goal_state, red_cores)
-    red_cores[:] = in_goals[0]
-    scores[0] -= len(in_goals[1])
-    scores[1] -= len(in_goals[2])
-    red_core_counts[0] += len(in_goals[1])
-    red_core_counts[1] += len(in_goals[2])
-    for x in in_goals[1]:
-        world.DestroyBody(x)
-    for x in in_goals[2]:
-        world.DestroyBody(x)
-    
-    if red_core_counts[0] >= 3:
-        return True, 2
-    if red_core_counts[1] >= 3:
-        return True, 1
-    
-    in_goals = categorize(goal_state, green_cores)
-    green_cores[:] = in_goals[0]
-    scores[0] += len(in_goals[1])
-    scores[1] += len(in_goals[2])   
-    for x in in_goals[1]:
-        world.DestroyBody(x)
-    for x in in_goals[2]:
-        world.DestroyBody(x)
+# Create the world
+class Simulator:
+    def init(self):
+        self.world = world(gravity=(0, 0), doSleep=True)
+        self.walls = [
+            self.world.CreateStaticBody(
+                position=(0, -MARGIN),
+                shapes=polygonShape(box=(ARENA_WIDTH + MARGIN, MARGIN)),
+            ),
+            self.world.CreateStaticBody(
+                position=(0, ARENA_HEIGHT+MARGIN),
+                shapes=polygonShape(box=(ARENA_WIDTH + MARGIN, MARGIN)),
+            ),
+            self.world.CreateStaticBody(
+                position=(ARENA_WIDTH+MARGIN, 0),
+                shapes=polygonShape(box=(MARGIN, ARENA_HEIGHT)),
+            ),
+            self.world.CreateStaticBody(
+                position=(-MARGIN, 0),
+                shapes=polygonShape(box=(MARGIN, ARENA_HEIGHT)),
+            ),
+            self.world.CreateStaticBody(
+                position=(0.0, 0.0),
+                angle = math.pi/4.0,
+                shapes=polygonShape(box=(0.05, 0.05)),
+            ),
+            self.world.CreateStaticBody(
+                position=(ARENA_WIDTH, ARENA_HEIGHT),
+                angle = math.pi/4.0,
+                shapes=polygonShape(box=(0.05, 0.05)),
+            )
+        ]
+        self.red_cores = [ self.world.CreateDynamicBody(position=pos) for pos in red_core_coords]
+        for body in self.red_cores:
+            circle = body.CreateCircleFixture(radius=0.036,
+                density=0.2, friction=0.3, restitution=0.6,
+                userData = RED_CORE_COLOR)
+            body.linearDamping = 1.1
 
-    if len(green_cores) == 0 and len(red_cores) == 0:
-        if scores[0] > scores[1]:
-            return True, 1
-        if scores[0] < scores[1]:
-            return True, 2
-        return True, 0
+        self.green_cores = [ self.world.CreateDynamicBody(position=pos) for pos in green_core_coords]
+        for body in self.green_cores:
+            circle = body.CreateCircleFixture(radius=0.036,
+                density=0.2, friction=0.3, restitution=0.6,
+                userData = GREEN_CORE_COLOR)
+            body.linearDamping = 1.1
+
+        self.robots = [self.world.CreateDynamicBody(position=coord[0], angle=coord[1]) for coord in robo_coords]
+        for body in self.robots:
+            body.CreatePolygonFixture(box=(ROBO_LEN/2.0, ROBO_WIDTH/2.0), density=3, friction=0.3)
+            body.angularDamping = 100.0
+
+        self.robots[0].fixtures[0].userData = TEAM1_COLOR
+        self.robots[1].fixtures[0].userData = TEAM1_COLOR
+        self.robots[2].fixtures[0].userData = TEAM2_COLOR
+        self.robots[3].fixtures[0].userData = TEAM2_COLOR
+
+        self.scores = [0,0]
+        self.red_core_counts = [0,0]
+
+    def apply_rules(self):
+        in_goals = categorize(goal_state, self.red_cores)
+        self.red_cores[:] = in_goals[0]
+        self.scores[0] -= len(in_goals[1])
+        self.scores[1] -= len(in_goals[2])
+        self.red_core_counts[0] += len(in_goals[1])
+        self.red_core_counts[1] += len(in_goals[2])
+        for x in in_goals[1]:
+            self.world.DestroyBody(x)
+        for x in in_goals[2]:
+            self.world.DestroyBody(x)
         
-    return False, 0
+        if self.red_core_counts[0] >= 3:
+            return True, 2
+        if self.red_core_counts[1] >= 3:
+            return True, 1
+        
+        in_goals = categorize(goal_state, self.green_cores)
+        self.green_cores[:] = in_goals[0]
+        self.scores[0] += len(in_goals[1])
+        self.scores[1] += len(in_goals[2])   
+        for x in in_goals[1]:
+            self.world.DestroyBody(x)
+        for x in in_goals[2]:
+            self.world.DestroyBody(x)
+
+        if len(self.green_cores) == 0 and len(self.red_cores) == 0:
+            if self.scores[0] > self.scores[1]:
+                return True, 1
+            if self.scores[0] < self.scores[1]:
+                return True, 2
+            return True, 0
+            
+        return False, 0
 
 console = Console()
 
-controllers=[SimpleBot3(0), SimpleBot3(1), SimpleBot(2), SimpleBot(3)]
+#controllers=[Prioritiser(0), Prioritiser(1), Prioritiser2(2), Prioritiser2(3)]
+controllers=[SimpleBot2(0), console, Prioritiser2(2), Prioritiser2(3)]
 #controllers=[ NullController(),  NullController(),console,NullController()]
 # --- main game loop ---
 vel = 0
@@ -336,7 +334,8 @@ turn = 0
 running = True
 finished = False
 winner = 0
-
+simulator = Simulator()
+simulator.init()
 while running and not finished:
     # Check the event queue
     for event in pygame.event.get():
@@ -344,23 +343,23 @@ while running and not finished:
             # The user closed the window or pressed escape
             running = False
         console.handleEvent(event)
-    red_coords=[core.position for core in red_cores]
-    green_coords=[core.position for core in green_cores]
-    bot_coords=[(bot.position, bot.angle) for bot in robots]
-    for robot, controller in zip(robots, controllers):
+    red_coords=[core.position for core in simulator.red_cores]
+    green_coords=[core.position for core in simulator.green_cores]
+    bot_coords=[(bot.position, bot.angle) for bot in simulator.robots]
+    for robot, controller in zip(simulator.robots, controllers):
         left_vel, right_vel = controller.getControls(bot_coords, green_coords, red_coords)
         steer(robot, left_vel * MAX_VEL, right_vel * MAX_VEL)        
     screen.fill((0, 0, 0, 0))
     draw_bases()
-    finished, winner = apply_rules(world, red_cores, green_cores, scores, red_core_counts)
-    draw_scores()
+    finished, winner = simulator.apply_rules()
+    draw_scores(simulator.scores, simulator.red_core_counts)
     # Draw the world
-    for body in world.bodies:
+    for body in simulator.world.bodies:
         for fixture in body.fixtures:
             fixture.shape.draw(body, fixture)
     # Make Box2D simulate the physics of our world for one step.
-    world.Step(TIME_STEP, 10, 10)
-    world.ClearForces()
+    simulator.world.Step(TIME_STEP, 10, 10)
+    simulator.world.ClearForces()
     # Flip the screen and try to keep at the target FPS
     pygame.display.flip()
     clock.tick(TARGET_FPS)
@@ -373,10 +372,10 @@ while running:
     screen.fill((0, 0, 0, 0))
     draw_bases()
     # Draw the world
-    for body in world.bodies:
+    for body in simulator.world.bodies:
         for fixture in body.fixtures:
             fixture.shape.draw(body, fixture)
-    draw_scores()
+    draw_scores(simulator.scores, simulator.red_core_counts)
     draw_winner(winner)
     pygame.display.flip()
     clock.tick(TARGET_FPS)
