@@ -45,7 +45,8 @@ POSSIBILITY OF SUCH DAMAGE."""
 
 
 import pygame
-from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_UP, K_DOWN, K_LEFT, K_RIGHT, K_RETURN, K_SPACE)
+from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_UP, K_DOWN, K_LEFT,\
+    K_RIGHT, K_RETURN, K_SPACE)
 from game_data import *
 from vec2d import *
 import math
@@ -59,7 +60,8 @@ from bots import bot_type, keyboard_listeners
 #Use this to select the bots
 player_names = ["SimpleBot2", "Human", "Prioritiser2", "Prioritiser2"]
 
-SCREEN_WIDTH, SCREEN_HEIGHT = int((ARENA_WIDTH + 2.0*MARGIN)*PPM), int((ARENA_HEIGHT + 2.0*MARGIN)*PPM)
+SCREEN_WIDTH = int((ARENA_WIDTH + 2.0*MARGIN)*PPM)
+SCREEN_HEIGHT = int((ARENA_HEIGHT + 2.0*MARGIN)*PPM)
 
 colors = {
     staticBody: (255, 255, 255, 255),
