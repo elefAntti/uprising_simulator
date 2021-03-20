@@ -13,7 +13,7 @@ In the bots.simple module there are couple of simple test programs to play again
 You can select "Human" as the player to control that bot with arrow keys.
 
 Other controls:
-    ESC Quit
-    SPACE pause
-    ENTER reset
+    * ESC Quit
+    * SPACE pause
+    * ENTER reset
 
