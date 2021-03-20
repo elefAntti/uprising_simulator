@@ -299,12 +299,7 @@ class Simulator:
             self.world.DestroyBody(x)
         for x in in_goals[2]:
             self.world.DestroyBody(x)
-        
-        if self.red_core_counts[0] >= 3:
-            return True, 2
-        if self.red_core_counts[1] >= 3:
-            return True, 1
-        
+
         in_goals = categorize(goal_state, self.green_cores)
         self.green_cores[:] = in_goals[0]
         self.scores[0] += len(in_goals[1])
@@ -313,15 +308,22 @@ class Simulator:
             self.world.DestroyBody(x)
         for x in in_goals[2]:
             self.world.DestroyBody(x)
-
-        if len(self.green_cores) == 0 and len(self.red_cores) == 0:
-            if self.scores[0] > self.scores[1]:
-                return True, 1
-            if self.scores[0] < self.scores[1]:
-                return True, 2
-            return True, 0
-            
-        return False, 0
+    def is_game_over(self):
+        return self.red_core_counts[0] >= 3 \
+            or self.red_core_counts[1] >= 3\
+            or (len(self.green_cores) == 0 and len(self.red_cores) == 0)
+    def get_winner(self):
+        if not self.is_game_over():
+            return 0
+        if self.red_core_counts[0] >= 3:
+            return 2
+        if self.red_core_counts[1] >= 3:
+            return 1
+        if self.scores[0] > self.scores[1]:
+            return 1
+        if self.scores[0] < self.scores[1]:
+            return 2
+        return 0       
 
 console = Console()
 
@@ -351,7 +353,10 @@ while running and not finished:
         steer(robot, left_vel * MAX_VEL, right_vel * MAX_VEL)        
     screen.fill((0, 0, 0, 0))
     draw_bases()
-    finished, winner = simulator.apply_rules()
+    simulator.apply_rules()
+    finished = simulator.is_game_over()
+    winner = simulator.get_winner()
+    
     draw_scores(simulator.scores, simulator.red_core_counts)
     # Draw the world
     for body in simulator.world.bodies:
