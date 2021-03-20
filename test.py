@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import pygame
-from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_UP, K_DOWN, K_LEFT, K_RIGHT)
+from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_UP, K_DOWN, K_LEFT, K_RIGHT, K_RETURN)
 from game_data import *
 from vec2d import *
 import math
@@ -130,12 +130,13 @@ finished = False
 winner = 0
 simulator = Simulator()
 simulator.init(controllers)
+
 while running:
-    # Check the event queue
     for event in pygame.event.get():
         if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
-            # The user closed the window or pressed escape
             running = False
+        if event.type == KEYDOWN and event.key == K_RETURN:
+            simulator.init(controllers)
         console.handleEvent(event)
     simulator.update()
     finished = simulator.is_game_over()
@@ -143,13 +144,11 @@ while running:
     screen.fill((0, 0, 0, 0))
     draw_bases()
     draw_scores(simulator.scores, simulator.red_core_counts)
-    # Draw the world
     for body in simulator.world.bodies:
         for fixture in body.fixtures:
             fixture.shape.draw(body, fixture)
     if finished:
         draw_winner(winner)
-    # Flip the screen and try to keep at the target FPS
     pygame.display.flip()
     clock.tick(TARGET_FPS)
 pygame.quit()
