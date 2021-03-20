@@ -5,7 +5,6 @@ import pygame
 from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_UP, K_DOWN, K_LEFT, K_RIGHT)
 
 import Box2D  # The main library
-# Box2D.b2 maps Box2D.b2Vec2 to vec2 (and so on)
 from Box2D.b2 import (world, polygonShape, circleShape, staticBody, dynamicBody, dot)
 
 import math
@@ -150,8 +149,6 @@ def draw_winner(winner):
     msg_pic=big_font.render(message, False, color)
     screen.blit(msg_pic,(100, SCREEN_HEIGHT/2 - 50)) 
 
-
-
 def steer_point(body, point, speed):
     forward = body.GetWorldVector((1,0))
     velocity = body.GetLinearVelocityFromWorldPoint(point)
@@ -229,9 +226,9 @@ def draw_scores(scores, red_core_counts):
     screen.blit(msg_pic,(150, SCREEN_HEIGHT - 50))
 
 
-# Create the world
 class Simulator:
-    def init(self):
+    def init(self, controllers):
+        self.controllers = controllers
         self.world = world(gravity=(0, 0), doSleep=True)
         self.walls = [
             self.world.CreateStaticBody(
@@ -263,14 +260,14 @@ class Simulator:
         ]
         self.red_cores = [ self.world.CreateDynamicBody(position=pos) for pos in red_core_coords]
         for body in self.red_cores:
-            circle = body.CreateCircleFixture(radius=0.036,
+            body.CreateCircleFixture(radius=0.036,
                 density=0.2, friction=0.3, restitution=0.6,
                 userData = RED_CORE_COLOR)
             body.linearDamping = 1.1
 
         self.green_cores = [ self.world.CreateDynamicBody(position=pos) for pos in green_core_coords]
         for body in self.green_cores:
-            circle = body.CreateCircleFixture(radius=0.036,
+            body.CreateCircleFixture(radius=0.036,
                 density=0.2, friction=0.3, restitution=0.6,
                 userData = GREEN_CORE_COLOR)
             body.linearDamping = 1.1
@@ -323,21 +320,30 @@ class Simulator:
             return 1
         if self.scores[0] < self.scores[1]:
             return 2
-        return 0       
+        return 0
+    def steer_robots(self):
+        red_coords=[core.position for core in self.red_cores]
+        green_coords=[core.position for core in self.green_cores]
+        bot_coords=[(bot.position, bot.angle) for bot in self.robots]
+        for robot, controller in zip(self.robots, self.controllers):
+            left_vel, right_vel = controller.getControls(bot_coords, green_coords, red_coords)
+            steer(robot, left_vel * MAX_VEL, right_vel * MAX_VEL)
+    def step_physics(self):
+        self.world.Step(TIME_STEP, 10, 10)
+        self.world.ClearForces()
 
 console = Console()
 
 #controllers=[Prioritiser(0), Prioritiser(1), Prioritiser2(2), Prioritiser2(3)]
 controllers=[SimpleBot2(0), console, Prioritiser2(2), Prioritiser2(3)]
 #controllers=[ NullController(),  NullController(),console,NullController()]
+
 # --- main game loop ---
-vel = 0
-turn = 0
 running = True
 finished = False
 winner = 0
 simulator = Simulator()
-simulator.init()
+simulator.init(controllers)
 while running and not finished:
     # Check the event queue
     for event in pygame.event.get():
@@ -345,26 +351,18 @@ while running and not finished:
             # The user closed the window or pressed escape
             running = False
         console.handleEvent(event)
-    red_coords=[core.position for core in simulator.red_cores]
-    green_coords=[core.position for core in simulator.green_cores]
-    bot_coords=[(bot.position, bot.angle) for bot in simulator.robots]
-    for robot, controller in zip(simulator.robots, controllers):
-        left_vel, right_vel = controller.getControls(bot_coords, green_coords, red_coords)
-        steer(robot, left_vel * MAX_VEL, right_vel * MAX_VEL)        
-    screen.fill((0, 0, 0, 0))
-    draw_bases()
+    simulator.steer_robots()
+    simulator.step_physics()
     simulator.apply_rules()
     finished = simulator.is_game_over()
     winner = simulator.get_winner()
-    
+    screen.fill((0, 0, 0, 0))
+    draw_bases()
     draw_scores(simulator.scores, simulator.red_core_counts)
     # Draw the world
     for body in simulator.world.bodies:
         for fixture in body.fixtures:
             fixture.shape.draw(body, fixture)
-    # Make Box2D simulate the physics of our world for one step.
-    simulator.world.Step(TIME_STEP, 10, 10)
-    simulator.world.ClearForces()
     # Flip the screen and try to keep at the target FPS
     pygame.display.flip()
     clock.tick(TARGET_FPS)
