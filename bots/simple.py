@@ -1,4 +1,5 @@
 import math
+from collections import namedtuple
 
 def vec_add(a,b):
     return (a[0] + b[0], a[1] + b[1])
@@ -84,6 +85,7 @@ def steer_to_target2(own_coords, own_dir, target):
         turn = turn2
         fw = (-1.0, -1.0)
     ratio = min(abs(turn) / 0.1, 1.0)
+    ratio = ratio * ratio
     turning = (-1.0, 1.0)
     if turn < 0.0:
         turning = (1.0, -1.0)
@@ -99,6 +101,22 @@ def get_base_coords(bot_index):
 def point_in_arena(point):
     return point[0] >= 0.0 and point[0] <= 1.5 \
         and point[1] >= 0.0 and point[1] <= 1.5 
+
+def get_partner_index(index):
+    return [1,0,3,2][index]
+
+def get_opponent_index(index):
+    return [2,3,0,1][index]
+
+def distance_to_line_segment(seg_a, seg_b, point):
+    direction = vec_sub(seg_b, seg_a)
+    distance = vec_len(direction)
+    direction = vec_mul(direction, 1.0/distance)
+    projected = vec_projectOn(direction, vec_sub(point, seg_a))
+    projected = clamp(projected, 0.0, distance)
+    closest_point = vec_add(seg_a, vec_mul(direction, projected))
+    return vec_dist(closest_point, point)
+
 
 class SimpleBot:
     def __init__(self, index):
@@ -180,9 +198,10 @@ class SimpleBot2:
         return steer_to_target(self.own_coords, own_dir, target)
 
 class SimpleBot3:
-    def __init__(self, index):
+    def __init__(self, index, new_steer = False):
         self._index=index
         self._goingToBase = False
+        self._new_steer = new_steer
         self.own_coords = (0.0,0.0)
     def getBaseCoords(self):
         if self._index < 2:
@@ -237,8 +256,10 @@ class SimpleBot3:
             self._goingToBase = True
         else:
             self._goingToBase = True
-        
-        return steer_to_target(self.own_coords, own_dir, target)
+        if self._new_steer:
+            return steer_to_target2(self.own_coords, own_dir, target)
+        else:
+            return steer_to_target(self.own_coords, own_dir, target)
 
 class Goalie:
     def __init__(self, index):
@@ -255,3 +276,169 @@ class Goalie:
         t = clamp(t, -.3, .3)
         target = vec_add(self._post, vec_mul(x_dir, t))
         return steer_to_target2(own_coords, own_dir, target)
+
+KIND_GREEN = 0
+KIND_RED = 1
+KIND_POINT = 2
+KIND_KICK_RED = 2
+KIND_HOME = 3
+KIND_KICK_AWAY =4
+KIND_KICK_GREEN = 5
+target_type = namedtuple("Target", ["kind", "coords"])
+
+class Prioritiser:
+    def __init__(self, index):
+        self._index=index
+        self._own_coords = (0.0, 0.0)
+        self._own_base = get_base_coords(self._index)
+        self._opponent_base = get_base_coords(get_opponent_index(self._index))
+        self._attack_dir = vec_normalize(vec_sub((0.75, 0.75), self._own_base))
+        self._post = vec_add(self._own_base, vec_mul(self._attack_dir, 0.44))
+        print("ind: {}, {} vs {}".format(index, self._own_base, self._opponent_base))
+    def evaluate(self, target):
+        score = 0.0
+        if target.kind == KIND_RED:
+            dot = vec_dot(vec_normalize(vec_sub(target.coords, self._opponent_base)), \
+                vec_normalize(vec_sub(self._own_coords, self._opponent_base)))
+            if vec_dist(self._opponent_base, self._own_coords) < \
+                vec_dist(self._opponent_base, target.coords):
+                score -= 10.0 
+            elif dot > 0.98: #Angle to opponent goal is good
+                score += 100.0
+            else:
+                score += 3.0
+            dist = min(distance_to_line_segment(target.coords, self._opponent_base, bot) for bot in self._bots)
+            if dist > 0.2: # the line to opponents goal is not blocked
+                score += 5.0
+        if target.kind == KIND_GREEN:
+            dot = vec_dot(vec_normalize(vec_sub(target.coords, self._own_base)), \
+                vec_normalize(vec_sub(self._own_coords, self._own_base)))
+            if vec_dist(self._own_base, self._own_coords) < \
+                vec_dist(self._own_base, target.coords):
+                score -= 3.0 
+            elif dot > 0.97: #Angle to opponent goal is good
+                score += 3.0
+            else:
+                score += 1.0
+            dist = min(distance_to_line_segment(target.coords, self._own_base, bot) for bot in self._bots)
+            if dist > 0.2: # the line to opponents goal is not blocked
+                score += 5.0
+        if target.kind == KIND_KICK_RED:
+            dist = min(distance_to_line_segment(target.coords, self._opponent_base, bot) for bot in self._bots)
+            if dist > 0.2: # the line to opponents goal is not blocked
+                score += 5.0
+            score += 6.0  
+        if target.kind == KIND_KICK_AWAY:
+            score += 4.0
+        score -= vec_dist(self._own_coords, target.coords)
+        score += vec_dist(self._partner_coords, target.coords)
+        return score
+    def getControls(self, bot_coords, green_coords, red_coords):
+        self._own_coords = bot_coords[self._index][0]
+        own_dir = bot_coords[self._index][1]
+        self._bots = [bot[0] for bot in bot_coords]
+        self._partner_coords = bot_coords[get_partner_index(self._index)][0]
+        self._red_coords = red_coords
+        targets = [target_type(KIND_RED, coords) for coords in red_coords]
+        targets += [target_type(KIND_GREEN, coords) for coords in green_coords]
+        for coord in red_coords:
+            kick_dir = vec_normalize(vec_sub(coord, self._opponent_base))
+            kick_pos = vec_sub(coord, vec_mul(kick_dir, -0.3))
+            if not point_in_arena(kick_pos):
+                kick_dir = vec_normalize(vec_sub(self._own_base, coord))
+                kick_pos = vec_sub(coord, vec_mul(kick_dir, -0.3))
+                targets.append(target_type(KIND_KICK_AWAY, kick_pos))
+            else:
+                targets.append(target_type(KIND_KICK_RED, kick_pos))
+        targets.append(target_type(KIND_HOME, self._post))
+        target = max(targets, key=lambda x: self.evaluate(x)).coords
+        return steer_to_target2(self._own_coords, own_dir, target)
+
+
+class Prioritiser2:
+    def __init__(self, index):
+        self._index=index
+        self._own_coords = (0.0, 0.0)
+        self._target = (0.0, 0.0)
+        self._own_base = get_base_coords(self._index)
+        self._opponent_base = get_base_coords(get_opponent_index(self._index))
+        self._attack_dir = vec_normalize(vec_sub((0.75, 0.75), self._own_base))
+        self._post = vec_add(self._own_base, vec_mul(self._attack_dir, 0.44))
+        print("ind: {}, {} vs {}".format(index, self._own_base, self._opponent_base))
+    def evaluate(self, target):
+        score = 0.0
+        if target.kind == KIND_RED:
+            dot = vec_dot(vec_normalize(vec_sub(target.coords, self._opponent_base)), \
+                vec_normalize(vec_sub(self._own_coords, self._opponent_base)))
+            if vec_dist(self._opponent_base, self._own_coords) < \
+                vec_dist(self._opponent_base, target.coords):
+                score -= 10.0 
+            elif dot > 0.98: #Angle to opponent goal is good
+                score += 100.0
+            else:
+                score += 3.0
+            dist = min(distance_to_line_segment(target.coords, self._opponent_base, bot) for bot in self._bots)
+            if dist > 0.2: # the line to opponents goal is not blocked
+                score += 5.0
+        if target.kind == KIND_GREEN:
+            dot = vec_dot(vec_normalize(vec_sub(target.coords, self._own_base)), \
+                vec_normalize(vec_sub(self._own_coords, self._own_base)))
+            if vec_dist(self._own_base, self._own_coords) < \
+                vec_dist(self._own_base, target.coords):
+                score -= 3.0 
+            elif dot > 0.97: #Angle to opponent goal is good
+                score += 3.0
+            else:
+                score += 1.0
+            dist = min(distance_to_line_segment(target.coords, self._own_base, bot) for bot in self._bots)
+            if dist > 0.2: # the line to own goal is not blocked
+                score += 5.0
+        if target.kind == KIND_KICK_RED:
+            dist = min(distance_to_line_segment(target.coords, self._opponent_base, bot) for bot in self._bots)
+            if dist > 0.2: # the line to opponents goal is not blocked
+                score += 5.0
+            score += 6.0  
+        if target.kind == KIND_KICK_GREEN:
+            dist = min(distance_to_line_segment(target.coords, self._own_base, bot) for bot in self._bots)
+            if dist > 0.2: # the line to own goal is not blocked
+                score += 3.0
+            score += 2.0 
+        if target.kind == KIND_KICK_AWAY:
+            score += 2.0
+        score -= vec_dist(self._own_coords, target.coords)
+        score += vec_dist(self._partner_coords, target.coords)
+        if vec_dist(self._partner_coords, target.coords) < 0.2:
+            score -= 3.0
+        if vec_dist(self._target, target.coords) < 0.1: #hysteresis
+            score += 1.0
+        return score
+    def getControls(self, bot_coords, green_coords, red_coords):
+        self._own_coords = bot_coords[self._index][0]
+        own_dir = bot_coords[self._index][1]
+        self._bots = [bot[0] for bot in bot_coords]
+        self._partner_coords = bot_coords[get_partner_index(self._index)][0]
+        self._red_coords = red_coords
+        targets = [target_type(KIND_RED, coords) for coords in red_coords]
+        targets += [target_type(KIND_GREEN, coords) for coords in green_coords]
+        for coord in red_coords:
+            kick_dir = vec_normalize(vec_sub(coord, self._opponent_base))
+            kick_pos = vec_sub(coord, vec_mul(kick_dir, -0.3))
+            if not point_in_arena(kick_pos):
+                kick_dir = vec_normalize(vec_sub(self._own_base, coord))
+                kick_pos = vec_sub(coord, vec_mul(kick_dir, -0.3))
+                targets.append(target_type(KIND_KICK_AWAY, kick_pos))
+            else:
+                targets.append(target_type(KIND_KICK_RED, kick_pos))
+        for coord in green_coords:
+            kick_dir = vec_normalize(vec_sub(coord, self._own_base))
+            kick_pos = vec_sub(coord, vec_mul(kick_dir, -0.3))
+            if not point_in_arena(kick_pos):
+                kick_dir = vec_normalize(vec_sub(self._own_base, coord))
+                kick_pos = vec_sub(coord, vec_mul(kick_dir, -0.3))
+                #targets.append(target_type(KIND_KICK_AWAY, kick_pos))
+            else:
+                targets.append(target_type(KIND_KICK_GREEN, kick_pos))
+       
+        targets.append(target_type(KIND_HOME, self._post))
+        self._target = max(targets, key=lambda x: self.evaluate(x)).coords
+        return steer_to_target2(self._own_coords, own_dir, self._target)
