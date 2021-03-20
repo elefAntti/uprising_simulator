@@ -17,3 +17,4 @@ Other controls:
 - SPACE pause
 - ENTER reset
 
+![Screenshot](screenshot.png)
