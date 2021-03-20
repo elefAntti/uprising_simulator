@@ -331,6 +331,11 @@ class Simulator:
     def step_physics(self):
         self.world.Step(TIME_STEP, 10, 10)
         self.world.ClearForces()
+    def update(self):
+        if not self.is_game_over():
+            self.steer_robots()
+            self.step_physics()
+            self.apply_rules()
 
 console = Console()
 
@@ -344,16 +349,14 @@ finished = False
 winner = 0
 simulator = Simulator()
 simulator.init(controllers)
-while running and not finished:
+while running:
     # Check the event queue
     for event in pygame.event.get():
         if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
             # The user closed the window or pressed escape
             running = False
         console.handleEvent(event)
-    simulator.steer_robots()
-    simulator.step_physics()
-    simulator.apply_rules()
+    simulator.update()
     finished = simulator.is_game_over()
     winner = simulator.get_winner()
     screen.fill((0, 0, 0, 0))
@@ -363,23 +366,9 @@ while running and not finished:
     for body in simulator.world.bodies:
         for fixture in body.fixtures:
             fixture.shape.draw(body, fixture)
+    if finished:
+        draw_winner(winner)
     # Flip the screen and try to keep at the target FPS
-    pygame.display.flip()
-    clock.tick(TARGET_FPS)
-
-while running:
-    for event in pygame.event.get():
-        if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
-            # The user closed the window or pressed escape
-            running = False
-    screen.fill((0, 0, 0, 0))
-    draw_bases()
-    # Draw the world
-    for body in simulator.world.bodies:
-        for fixture in body.fixtures:
-            fixture.shape.draw(body, fixture)
-    draw_scores(simulator.scores, simulator.red_core_counts)
-    draw_winner(winner)
     pygame.display.flip()
     clock.tick(TARGET_FPS)
 pygame.quit()
