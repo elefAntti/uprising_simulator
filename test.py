@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import pygame
-from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_UP, K_DOWN, K_LEFT, K_RIGHT, K_RETURN)
+from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_UP, K_DOWN, K_LEFT, K_RIGHT, K_RETURN, K_SPACE)
 from game_data import *
 from vec2d import *
 import math
-import Box2D  # The main library
+import Box2D
 from Box2D.b2 import (polygonShape, circleShape, staticBody, dynamicBody)
 from simulator import Simulator
 from bots.simple import SimpleBot, SimpleBot2, SimpleBot3, Prioritiser2, Prioritiser
@@ -77,6 +77,11 @@ def draw_winner(winner):
     msg_pic=big_font.render(message, False, color)
     screen.blit(msg_pic,(100, SCREEN_HEIGHT/2 - 50)) 
 
+def draw_info(message):
+    color = (128,128,128,255)
+    msg_pic=big_font.render(message, False, color)
+    screen.blit(msg_pic,(100, SCREEN_HEIGHT/2 - 50)) 
+
 class Console:
     def __init__(self):
         self.vel = 0.0
@@ -106,10 +111,6 @@ class Console:
         right_vel *= scale
         return left_vel,right_vel
 
-class NullController:
-    def getControls(self, *args):
-        return 0.0,0.0
-
 def draw_scores(scores, red_core_counts):
     message='score: {} reds: {}'.format(scores[0], red_core_counts[0])
     msg_pic=font.render(message, False, TEAM1_COLOR)
@@ -120,13 +121,12 @@ def draw_scores(scores, red_core_counts):
 
 console = Console()
 
-#controllers=[Prioritiser(0), Prioritiser(1), Prioritiser2(2), Prioritiser2(3)]
 controllers=[SimpleBot2(0), console, Prioritiser2(2), Prioritiser2(3)]
-#controllers=[ NullController(),  NullController(),console,NullController()]
 
 # --- main game loop ---
 running = True
 finished = False
+paused = False
 winner = 0
 simulator = Simulator()
 simulator.init(controllers)
@@ -137,8 +137,11 @@ while running:
             running = False
         if event.type == KEYDOWN and event.key == K_RETURN:
             simulator.init(controllers)
+        if event.type == KEYDOWN and event.key == K_SPACE:
+            paused = not paused
         console.handleEvent(event)
-    simulator.update()
+    if not paused:
+        simulator.update()
     finished = simulator.is_game_over()
     winner = simulator.get_winner()
     screen.fill((0, 0, 0, 0))
@@ -149,6 +152,8 @@ while running:
             fixture.shape.draw(body, fixture)
     if finished:
         draw_winner(winner)
+    elif paused: 
+        draw_info("Pause")
     pygame.display.flip()
     clock.tick(TARGET_FPS)
 pygame.quit()
