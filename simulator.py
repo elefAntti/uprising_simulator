@@ -98,6 +98,7 @@ class Simulator:
 
         self.scores = [0,0]
         self.red_core_counts = [0,0]
+        self.simulation_time = 0
 
     def apply_rules(self):
         in_goals = categorize(goal_state, self.red_cores)
@@ -121,8 +122,9 @@ class Simulator:
             self.world.DestroyBody(x)
     def is_game_over(self):
         return self.red_core_counts[0] >= 3 \
-            or self.red_core_counts[1] >= 3\
-            or (len(self.green_cores) == 0 and len(self.red_cores) == 0)
+            or self.red_core_counts[1] >= 3 \
+            or (len(self.green_cores) == 0 and len(self.red_cores) == 0) \
+            or self.simulation_time >= TIME_LIMIT
     def get_winner(self):
         if not self.is_game_over():
             return 0
@@ -145,6 +147,7 @@ class Simulator:
     def step_physics(self):
         self.world.Step(TIME_STEP, 10, 10)
         self.world.ClearForces()
+        self.simulation_time += 1.0 / TARGET_FPS
     def update(self):
         if not self.is_game_over():
             self.steer_robots()
