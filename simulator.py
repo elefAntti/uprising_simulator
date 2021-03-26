@@ -4,6 +4,7 @@ import Box2D  # The main library
 from Box2D.b2 import (world, polygonShape, circleShape, staticBody, dynamicBody, dot)
 from vec2d import *
 import math
+import random
 
 def categorize(func, seq):
     """Return mapping from categories to lists
@@ -40,8 +41,21 @@ def steer(body, left_speed, right_speed):
     impulse=-transSpeed*body.mass*side
     body.ApplyLinearImpulse(impulse=impulse, point=body.position, wake=False)
 
+
+def GetRandomPoints(count, safe_distance = 0.2):
+    generated_points=[]
+    min_val = safe_distance
+    max_val = ARENA_WIDTH - safe_distance
+    while len(generated_points) < count:
+        point = (random.uniform(min_val, max_val),
+                 random.uniform(min_val, max_val))
+        if min((vec_dist(point, other) for other in generated_points),\
+               default = 2.0 * safe_distance) > safe_distance:
+            generated_points.append(point)
+    return generated_points
+
 class Simulator:
-    def init(self, controllers):
+    def init(self, controllers, randomize = False):
         self.controllers = controllers
         self.world = world(gravity=(0, 0), doSleep=True)
         self.walls = [
@@ -72,14 +86,20 @@ class Simulator:
                 shapes=polygonShape(box=(0.05, 0.05)),
             )
         ]
-        self.red_cores = [ self.world.CreateDynamicBody(position=pos) for pos in red_core_coords]
+        if not randomize:
+            self.red_cores = [ self.world.CreateDynamicBody(position=pos) for pos in red_core_coords]
+            self.green_cores = [ self.world.CreateDynamicBody(position=pos) for pos in green_core_coords]
+        else:
+            random_pts = GetRandomPoints(8)
+            self.red_cores = [ self.world.CreateDynamicBody(position=pos) for pos in random_pts[:4]]
+            self.green_cores = [ self.world.CreateDynamicBody(position=pos) for pos in random_pts[4:]]
+
         for body in self.red_cores:
             body.CreateCircleFixture(radius=0.036,
                 density=0.2, friction=0.3, restitution=0.6,
                 userData = RED_CORE_COLOR)
             body.linearDamping = 1.1
 
-        self.green_cores = [ self.world.CreateDynamicBody(position=pos) for pos in green_core_coords]
         for body in self.green_cores:
             body.CreateCircleFixture(radius=0.036,
                 density=0.2, friction=0.3, restitution=0.6,
@@ -145,7 +165,9 @@ class Simulator:
             left_vel, right_vel = controller.get_controls(bot_coords, green_coords, red_coords)
             steer(robot, left_vel * MAX_VEL, right_vel * MAX_VEL)
     def step_physics(self):
-        self.world.Step(TIME_STEP, 10, 10)
+        velocityIterations=10
+        positionIterations=10
+        self.world.Step(TIME_STEP, velocityIterations, positionIterations)
         self.world.ClearForces()
         self.simulation_time += 1.0 / TARGET_FPS
     def update(self):

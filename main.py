@@ -45,8 +45,7 @@ POSSIBILITY OF SUCH DAMAGE."""
 
 
 import pygame
-from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_UP, K_DOWN, K_LEFT,\
-    K_RIGHT, K_RETURN, K_SPACE)
+from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_r, K_RETURN, K_SPACE)
 from game_data import *
 from vec2d import *
 import math
@@ -58,7 +57,7 @@ import bots.human
 from bots import bot_type, keyboard_listeners
 
 #Use this to select the bots
-player_names = ["SimpleBot2", "Human", "Prioritiser2", "Prioritiser2"]
+player_names = ["SimpleBot2", "SimpleBot2", "Prioritiser2", "Prioritiser2"]
 
 SCREEN_WIDTH = int((ARENA_WIDTH + 2.0*MARGIN)*PPM)
 SCREEN_HEIGHT = int((ARENA_HEIGHT + 2.0*MARGIN)*PPM)
@@ -146,18 +145,21 @@ controllers=create_controllers()
 
 running = True
 finished = False
-paused = False
+paused = True
+random = False
 winner = 0
 simulator = Simulator()
-simulator.init(controllers)
+simulator.init(controllers, random)
 
 while running:
     for event in pygame.event.get():
         if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
             running = False
-        if event.type == KEYDOWN and event.key == K_RETURN:
+        if event.type == KEYDOWN and event.key == K_r:
+            random = not random
+        if event.type == KEYDOWN and (event.key == K_RETURN or event.key == K_r ):
             controllers=create_controllers()
-            simulator.init(controllers)
+            simulator.init(controllers, random)
         if event.type == KEYDOWN and event.key == K_SPACE:
             paused = not paused
         for listener in keyboard_listeners:

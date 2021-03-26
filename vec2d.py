@@ -23,3 +23,6 @@ def vec_move(orig, dir, amount):
 
 def vec_projectOn(on, vec):
     return vec_dot(vec, vec_normalize(on))
+
+def vec_dist(a, b):
+    return vec_len(vec_sub(a, b))
