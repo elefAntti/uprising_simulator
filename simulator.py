@@ -17,9 +17,9 @@ def categorize(func, seq):
 
 def goal_state(core):
     det = vec_dot((1.0, -1.0), vec_sub(core.position, (0.0, ARENA_HEIGHT)))
-    if det < 0.4:
+    if det < BASE_SIZE:
         return 1
-    if det > (ARENA_HEIGHT + ARENA_WIDTH - 0.4):
+    if det > (ARENA_HEIGHT + ARENA_WIDTH - BASE_SIZE):
         return 2
     return 0
 
@@ -32,7 +32,6 @@ def steer_point(body, point, speed):
     body.ApplyForce(forward * min(STEER_FORCE, max(-STEER_FORCE, k*err)), point, True)
 
 def steer(body, left_speed, right_speed):
-    
     steer_point(body, body.GetWorldPoint((0.0,0.05)), left_speed)
     steer_point(body, body.GetWorldPoint((0.0,-0.05)), right_speed)
 
@@ -42,15 +41,19 @@ def steer(body, left_speed, right_speed):
     body.ApplyLinearImpulse(impulse=impulse, point=body.position, wake=False)
 
 
-def GetRandomPoints(count, safe_distance = 0.2):
+def GetRandomPoints(count, safe_distance = CORE_RADIUS):
     generated_points=[]
     min_val = safe_distance
     max_val = ARENA_WIDTH - safe_distance
     while len(generated_points) < count:
         point = (random.uniform(min_val, max_val),
                  random.uniform(min_val, max_val))
+        if vec_dist(point, TEAM1_BASE) < BASE_SAFETY_AREA:
+            continue
+        if vec_dist(point, TEAM2_BASE) < BASE_SAFETY_AREA:
+            continue
         if min((vec_dist(point, other) for other in generated_points),\
-               default = 2.0 * safe_distance) > safe_distance:
+               default = float("inf")) > safe_distance * 2.0:
             generated_points.append(point)
     return generated_points
 
@@ -95,13 +98,13 @@ class Simulator:
             self.green_cores = [ self.world.CreateDynamicBody(position=pos) for pos in random_pts[4:]]
 
         for body in self.red_cores:
-            body.CreateCircleFixture(radius=0.036,
+            body.CreateCircleFixture(radius=CORE_RADIUS,
                 density=0.2, friction=0.3, restitution=0.6,
                 userData = RED_CORE_COLOR)
             body.linearDamping = 1.1
 
         for body in self.green_cores:
-            body.CreateCircleFixture(radius=0.036,
+            body.CreateCircleFixture(radius=CORE_RADIUS,
                 density=0.2, friction=0.3, restitution=0.6,
                 userData = GREEN_CORE_COLOR)
             body.linearDamping = 1.1
