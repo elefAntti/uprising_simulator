@@ -1,6 +1,6 @@
 # uprising_simulator
 
-![Screenshot](screenshot.png)
+![Screenshot](images/screenshot.png)
 
 Simulate the game played at RobotUprising hackathon
 
@@ -26,3 +26,14 @@ Other controls:
 Dependencies:
   - [pybox2d](https://github.com/pybox2d/pybox2d)
   - [pygame](https://www.pygame.org/)
+
+# win_probabilities
+
+![Screenshot](images/win_probabilities.png)
+
+A script that runs many simulated games from random startup configurations and computes how often each side wins.
+
+Dependencies:
+  - [pybox2d](https://github.com/pybox2d/pybox2d)
+  - [tabulate](https://pypi.org/project/tabulate/)
+  - [tqdm](https://pypi.org/project/tqdm/)
