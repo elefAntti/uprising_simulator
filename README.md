@@ -1,5 +1,7 @@
 # uprising_simulator
 
+![Screenshot](screenshot.png)
+
 Simulate the game played at RobotUprising hackathon
 
 Two teams of robots (differential drive with tracks) compete in an arena,
@@ -19,4 +21,6 @@ Other controls:
 - ENTER reset
 - R toggle random core starting positions
 
-![Screenshot](screenshot.png)
+Dependencies:
+  - pybox2d
+  - pygame
