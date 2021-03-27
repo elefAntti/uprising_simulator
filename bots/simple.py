@@ -257,7 +257,6 @@ class Prioritiser2:
         self._opponent_base = get_base_coords(get_opponent_index(self._index))
         self._attack_dir = vec_normalize(vec_sub((0.75, 0.75), self._own_base))
         self._post = vec_add(self._own_base, vec_mul(self._attack_dir, 0.44))
-        print("ind: {}, {} vs {}".format(index, self._own_base, self._opponent_base))
     def evaluate(self, target):
         score = 0.0
         if target.kind == KIND_RED:
