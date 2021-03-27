@@ -45,6 +45,9 @@ def vec_90deg(a):
 def vec_mix(a,b, ratio):
     return vec_add(vec_mul(a, (1.0 - ratio)), vec_mul(b, ratio))
 
+def vec_infnorm(a):
+    return max(abs(a[0]), abs(a[1]))
+
 def dist_to_neutral_corner(pos):
     return min(vec_dist((0.0, 0.0), pos), vec_dist((1.5, 1.5), pos))
 

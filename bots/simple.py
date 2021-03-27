@@ -334,3 +334,64 @@ class Prioritiser2:
         targets.append(target_type(KIND_HOME, self._post))
         self._target = max(targets, key=lambda x: self.evaluate(x)).coords
         return steer_to_target2(self._own_coords, own_dir, self._target)
+
+
+class PotentialWinnerBase:
+    """
+    Calculates a potential field and steers based on its gradient
+    """
+    def __init__(self, index, param):
+        self._index = index
+        self._param = param
+    def potential_at(self, coords):
+        opponent_base = get_base_coords(get_opponent_index(self._index))
+        own_base = get_base_coords(self._index)
+        potential = 0.0
+        potential -= 0.2 / vec_dist(coords, self._partner_coords)
+        potential -= 1.0 / math.pow(coords[0] / 0.1, 4.0)
+        potential -= 1.0 / math.pow(coords[1] / 0.1, 4.0)
+        potential -= 1.0 / math.pow((1.5 - coords[0]) / 0.1, 4.0)
+        potential -= 1.0 / math.pow((1.5 - coords[1]) / 0.1, 4.0)
+        for r in self._red_coords:
+            dot = vec_dot( vec_normalize(vec_sub(coords, opponent_base)),\
+                           vec_normalize(vec_sub(coords, r))) + 1.0
+            potential += dot / vec_dist(coords, r)
+        for r in self._green_coords:
+            dot = vec_dot(vec_normalize(vec_sub(coords, own_base)),\
+                           vec_normalize(vec_sub(coords, r))) + 1.0
+            potential += 0.2 * dot / vec_dist(coords, r)
+        return potential
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        self._partner_coords = bot_coords[get_partner_index(self._index)][0]
+        self._red_coords = red_coords
+        self._green_coords = green_coords
+        self._other_bots = [bot_coords[get_opponent_index(self._index)][0],
+            bot_coords[get_opponent_index(get_partner_index(self._index))][0]]
+        own_coords = bot_coords[self._index][0]
+        own_dir = bot_coords[self._index][1]
+        forward=vec_unitInDir(own_dir)
+        left=vec_90deg(forward)
+
+        sample_point = vec_add(own_coords, vec_mul(forward, 0.05))
+        d_long = self.potential_at(vec_move(sample_point, forward, 0.005))
+        d_long -= self.potential_at(vec_move(sample_point, forward, -0.005))
+
+        d_side = self.potential_at(vec_move(sample_point, left, 0.005))
+        d_side -= self.potential_at(vec_move(sample_point, left, -0.005))
+
+        left_track = -d_side + d_long
+        right_track = d_side + d_long
+
+        factor = vec_infnorm((left_track, right_track))
+        return left_track/factor, right_track/factor
+
+
+@register_bot
+class PotentialWinner(PotentialWinnerBase):
+    def __init__(self, index):
+        PotentialWinnerBase.__init__(self, index, 0.1)
+
+@register_bot
+class PotentialWinner2(PotentialWinnerBase):
+    def __init__(self, index):
+        PotentialWinnerBase.__init__(self, index, 0.07)
