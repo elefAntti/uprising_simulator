@@ -5,6 +5,8 @@ from bots import register_bot
 
 @register_bot
 class NullController:
+    def __init__(self, index):
+        pass
     def get_controls(self, *args):
         return 0.0,0.0
 
@@ -153,7 +155,7 @@ class SimpleBot3:
         else:
             return steer_to_target(self.own_coords, own_dir, target)
 
-@register_bot
+#@register_bot
 class Goalie:
     def __init__(self, index):
         self._index=index
