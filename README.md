@@ -1,6 +1,6 @@
 # uprising_simulator
 
-<img src="https://github.com/elefAntti/uprising_simulator/blob/main/images/screenshot.png" alt="Screenshot" width="400px">
+<img src="https://github.com/elefAntti/uprising_simulator/blob/main/images/screenshot.png" alt="Screenshot" width="600px">
 
 Simulate the game played at RobotUprising hackathon
 
@@ -36,11 +36,11 @@ Dependencies:
   - [tabulate](https://pypi.org/project/tabulate/)
   - [tqdm](https://pypi.org/project/tqdm/)
 
-One against one
+## One against one
 <img src="https://github.com/elefAntti/uprising_simulator/blob/main/images/win_probabilities.png" alt="Screenshot" width="400px">
 
-One against many
+## One against many
 <img src="https://github.com/elefAntti/uprising_simulator/blob/main/images/one_against_many.png" alt="Screenshot" width="600px">
 
-All against all
+### All against all
 <img src="https://github.com/elefAntti/uprising_simulator/blob/main/images/all_against_all.png" alt="Screenshot" width="100%">
