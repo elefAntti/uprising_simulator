@@ -354,6 +354,11 @@ class PotentialWinnerBase:
         potential -= 1.0 / math.pow(coords[1] / 0.1, 4.0)
         potential -= 1.0 / math.pow((1.5 - coords[0]) / 0.1, 4.0)
         potential -= 1.0 / math.pow((1.5 - coords[1]) / 0.1, 4.0)
+        for ab in pairs(self._other_bots):
+            weight = 1.0 - smoothstep(vec_dist(ab[0][0], ab[1][0]) / 0.3)
+            avg = vec_average(ab[0][0], ab[1][0])
+            potential -= self._param * weight / vec_dist(coords, avg)
+
         for r in self._red_coords:
             dot = vec_dot( vec_normalize(vec_sub(coords, opponent_base)),\
                            vec_normalize(vec_sub(coords, r))) + 1.0
@@ -367,8 +372,7 @@ class PotentialWinnerBase:
         self._partner_coords = bot_coords[get_partner_index(self._index)][0]
         self._red_coords = red_coords
         self._green_coords = green_coords
-        self._other_bots = [bot_coords[get_opponent_index(self._index)][0],
-            bot_coords[get_opponent_index(get_partner_index(self._index))][0]]
+        self._other_bots = other_bots(bot_coords, self._index)
         own_coords = bot_coords[self._index][0]
         own_dir = bot_coords[self._index][1]
         forward=vec_unitInDir(own_dir)
@@ -391,9 +395,9 @@ class PotentialWinnerBase:
 @register_bot
 class PotentialWinner(PotentialWinnerBase):
     def __init__(self, index):
-        PotentialWinnerBase.__init__(self, index, 0.1)
+        PotentialWinnerBase.__init__(self, index, 0.0)
 
 @register_bot
 class PotentialWinner2(PotentialWinnerBase):
     def __init__(self, index):
-        PotentialWinnerBase.__init__(self, index, 0.07)
+        PotentialWinnerBase.__init__(self, index, 2.0)

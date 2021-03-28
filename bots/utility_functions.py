@@ -48,6 +48,9 @@ def vec_mix(a,b, ratio):
 def vec_infnorm(a):
     return max(abs(a[0]), abs(a[1]))
 
+def vec_average(a,b):
+    return vec_mul(vec_add(a, b), 0.5)
+
 def dist_to_neutral_corner(pos):
     return min(vec_dist((0.0, 0.0), pos), vec_dist((1.5, 1.5), pos))
 
@@ -118,3 +121,15 @@ def distance_to_line_segment(seg_a, seg_b, point):
     projected = clamp(projected, 0.0, distance)
     closest_point = vec_add(seg_a, vec_mul(direction, projected))
     return vec_dist(closest_point, point)
+
+def smoothstep(x):
+    if x <= 0.0:
+        return 0.0
+    if x>=1.0:
+        return 1.0
+    return 3.0 * x * x - 2.0 * x * x * x
+
+def pairs(elems):
+    for i in range(len(elems)):
+        for j in range(i):
+            yield (elems[i], elems[j])
