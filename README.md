@@ -29,11 +29,18 @@ Dependencies:
 
 # win_probabilities
 
-![Screenshot](images/win_probabilities.png)
-
 A script that runs many simulated games from random startup configurations and computes how often each side wins.
 
 Dependencies:
   - [pybox2d](https://github.com/pybox2d/pybox2d)
   - [tabulate](https://pypi.org/project/tabulate/)
   - [tqdm](https://pypi.org/project/tqdm/)
+
+One against one
+![Screenshot](images/win_probabilities.png)
+
+One against many
+![Screenshot](images/one_against_many.png)
+
+All against all
+![Screenshot](images/all_against_all.png)
