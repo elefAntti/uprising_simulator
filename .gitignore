@@ -1,1 +1,3 @@
 *.pyc
+localdata
+.DS_Store
