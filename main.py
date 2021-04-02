@@ -49,15 +49,47 @@ from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_r, K_RETURN, K_SPAC
 from game_data import *
 from utils.vec2d import *
 import math
+import sys
 import Box2D
 from Box2D.b2 import (polygonShape, circleShape, staticBody, dynamicBody)
 from simulator import Simulator
 import bots.simple
 import bots.human
+import argparse
 from bots import bot_type, keyboard_listeners
 
-#Use this to select the bots
-player_names = ["SimpleBot2", "SimpleBot2", "Prioritiser2", "Prioritiser2"]
+parser = argparse.ArgumentParser(prog='main', \
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('--team1', type=str, default="Team 1", help="Team 1 name")
+parser.add_argument('--team2', type=str, default="Team 2", help="Team 2 name")
+parser.add_argument('bots', nargs='*', default=[], help='''\
+     0, 2 or 4 bot names.
+     0: Play a default match
+     2: Play the selected bots against each other (2 in each team)
+     4: Play the selected bots against each other
+     ''')
+
+args = parser.parse_args()
+
+
+team1_name = args.team1
+team2_name = args.team2
+ 
+for name in args.bots:
+    if name not in bots.bot_type:
+        print("'{}' isn't a registered bot class".format(name))
+        parser.print_help()
+        sys.exit(1)
+
+if len(args.bots) == 0:
+    player_names = ["PotentialWinner", "PotentialWinner", "SimpleBot2", "SimpleBot2"]
+elif len(args.bots) == 2:
+    player_names = [args.bots[0], args.bots[0], args.bots[1], args.bots[1]]
+elif len(args.bots) == 4:
+    player_names = args.bots
+else:
+    parser.print_help()
+    sys.exit(1)
 
 SCREEN_WIDTH = int((ARENA_WIDTH + 2.0*MARGIN)*PPM)
 SCREEN_HEIGHT = int((ARENA_HEIGHT + 2.0*MARGIN)*PPM)
@@ -115,11 +147,11 @@ def draw_winner(winner):
     message = "Draw"
     if winner == 1:
         color = TEAM1_COLOR
-        message = "Team 1 won"
+        message = team1_name + " won"
 
     if winner == 2:
         color = TEAM2_COLOR
-        message = "Team 2 won"
+        message = team2_name + " won"
 
     msg_pic=big_font.render(message, False, color)
     screen.blit(msg_pic,(100, SCREEN_HEIGHT/2 - 50)) 
