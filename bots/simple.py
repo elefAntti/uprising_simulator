@@ -2,6 +2,7 @@ import math
 from collections import namedtuple
 from bots.utility_functions import *
 from utils.math_utils import * 
+from utils.velocity_estimate import Predictor
 from bots import register_bot
 
 @register_bot
@@ -338,7 +339,6 @@ class Prioritiser2:
         self._target = max(targets, key=lambda x: self.evaluate(x)).coords
         return steer_to_target2(self._own_coords, own_dir, self._target)
 
-
 class PotentialWinnerBase:
     """
     Calculates a potential field and steers based on its gradient
@@ -346,6 +346,7 @@ class PotentialWinnerBase:
     def __init__(self, index, param):
         self._index = index
         self._param = param
+        self._predict=Predictor(index)
     def potential_at(self, coords):
         opponent_base = get_base_coords(get_opponent_index(self._index))
         own_base = get_base_coords(self._index)
@@ -358,7 +359,7 @@ class PotentialWinnerBase:
         for ab in pairs(self._other_bots):
             weight = 1.0 - smoothstep(vec_dist(ab[0][0], ab[1][0]) / 0.3)
             avg = vec_average(ab[0][0], ab[1][0])
-            potential -= self._param * weight / vec_dist(coords, avg)
+            potential -= 2.0 * weight / vec_dist(coords, avg)
 
         for r in self._red_coords:
             dot = vec_dot( vec_normalize(vec_sub(coords, opponent_base)),\
@@ -371,8 +372,13 @@ class PotentialWinnerBase:
         return potential
     def get_controls(self, bot_coords, green_coords, red_coords):
         self._partner_coords = bot_coords[get_partner_index(self._index)][0]
-        self._red_coords = red_coords
-        self._green_coords = green_coords
+        if self._param == 0:
+            self._red_coords = red_coords
+            self._green_coords = green_coords
+        else:
+            self._predict.observe(bot_coords,green_coords, red_coords)
+            self._red_coords = self._predict.predict_red()
+            self._green_coords = self._predict.predict_green()
         self._other_bots = other_bots(bot_coords, self._index)
         own_coords = bot_coords[self._index][0]
         own_dir = bot_coords[self._index][1]
@@ -396,9 +402,9 @@ class PotentialWinnerBase:
 @register_bot
 class PotentialWinner(PotentialWinnerBase):
     def __init__(self, index):
-        PotentialWinnerBase.__init__(self, index, 0.0)
+        PotentialWinnerBase.__init__(self, index, 0)
 
 @register_bot
 class PotentialWinner2(PotentialWinnerBase):
     def __init__(self, index):
-        PotentialWinnerBase.__init__(self, index, 2.0)
+        PotentialWinnerBase.__init__(self, index, 1)

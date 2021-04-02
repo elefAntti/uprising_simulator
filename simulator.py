@@ -40,6 +40,8 @@ def steer(body, left_speed, right_speed):
     impulse=-transSpeed*body.mass*side
     body.ApplyLinearImpulse(impulse=impulse, point=body.position, wake=False)
 
+def bvec_to_tuple(vec):
+    return (vec[0], vec[1])
 
 def GetRandomPoints(count, safe_distance = CORE_RADIUS):
     generated_points=[]
@@ -161,9 +163,9 @@ class Simulator:
             return 2
         return 0
     def steer_robots(self):
-        red_coords=[core.position for core in self.red_cores]
-        green_coords=[core.position for core in self.green_cores]
-        bot_coords=[(bot.position, bot.angle) for bot in self.robots]
+        red_coords=[bvec_to_tuple(core.position) for core in self.red_cores]
+        green_coords=[bvec_to_tuple(core.position) for core in self.green_cores]
+        bot_coords=[(bvec_to_tuple(bot.position), bot.angle) for bot in self.robots]
         for robot, controller in zip(self.robots, self.controllers):
             left_vel, right_vel = controller.get_controls(bot_coords, green_coords, red_coords)
             steer(robot, left_vel * MAX_VEL, right_vel * MAX_VEL)
