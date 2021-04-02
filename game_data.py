@@ -1,4 +1,4 @@
-from vec2d import *
+from utils.vec2d import *
 import math
 
 PPM = 300.0  # pixels per meter

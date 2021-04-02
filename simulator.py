@@ -2,7 +2,7 @@ from collections import defaultdict
 from game_data import *
 import Box2D  # The main library
 from Box2D.b2 import (world, polygonShape, circleShape, staticBody, dynamicBody, dot)
-from vec2d import *
+from utils.vec2d import *
 import math
 import random
 

@@ -1,6 +1,7 @@
 import math
 from collections import namedtuple
 from bots.utility_functions import *
+from utils.math_utils import * 
 from bots import register_bot
 
 @register_bot

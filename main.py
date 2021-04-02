@@ -47,7 +47,7 @@ POSSIBILITY OF SUCH DAMAGE."""
 import pygame
 from pygame.locals import (QUIT, KEYDOWN, KEYUP, K_ESCAPE, K_r, K_RETURN, K_SPACE)
 from game_data import *
-from vec2d import *
+from utils.vec2d import *
 import math
 import Box2D
 from Box2D.b2 import (polygonShape, circleShape, staticBody, dynamicBody)
