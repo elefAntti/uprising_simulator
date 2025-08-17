@@ -1,6 +1,8 @@
 import sys
 from simulator import Simulator
 import bots.simple
+import bots.chatgpt
+import bots.red_slammer
 from tqdm import tqdm
 from tabulate import tabulate
 from bots import bot_type
@@ -12,8 +14,21 @@ def create_controllers(player_names):
 
 def simulate_game(player_names):
     controllers=create_controllers(player_names)
+    noise={
+        # tweak relative sigmas (std dev of multiplicative noise around 1.0)
+        "core_radius": 0.02,            # ~±5% cap in code
+        "core_density": 0.15,
+        "core_friction": 0.25,
+        "core_restitution": 0.20,
+        "core_linear_damping": 0.10,
+        "core_angular_damping": 0.20,
+        "robot_density": 0.10,
+        "robot_friction": 0.25,
+        "robot_ang_damp": 0.10,
+        "robot_speed_scale": 0.05,      # set 0.0 to disable actuator randomness
+    }
     simulator = Simulator()
-    simulator.init(controllers, True)
+    simulator.init(controllers, True, noise=noise)
     while not simulator.is_game_over():
         simulator.update()
     return simulator.get_winner()
