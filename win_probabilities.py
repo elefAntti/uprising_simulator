@@ -1,15 +1,18 @@
 import sys
 from simulator import Simulator
-import bots.simple
 from tqdm import tqdm
 from tabulate import tabulate
-from bots import bot_type
 import math
 import argparse
 import random
 
+from bots import load_all_bots, get_bot_registry
+
+load_all_bots()
+bot_types = get_bot_registry()
+
 def create_controllers(player_names):
-    return [bot_type[player_names[i]](i) for i in range(4)]
+    return [bot_types[player_names[i]](i) for i in range(4)]
 
 
 
@@ -117,13 +120,13 @@ args = parser.parse_args()
 n_games = args.games
 
 for name in args.bots:
-    if name not in bots.bot_type:
+    if name not in bot_types:
         print("'{}' isn't a registered bot class".format(name))
         parser.print_help()
         sys.exit(1)
 
 if len(args.bots) == 0:
-    bot_names = list(bots.bot_type.keys())
+    bot_names = list(bot_types.keys())
     headers = ["Against"] + bot_names
     results = [[name] + [ "x" for _ in bot_names ] for name in bot_names]
     for i in range(len(bot_names)):
@@ -140,7 +143,7 @@ if len(args.bots) == 0:
             print(tabulate(results, headers=headers, tablefmt = args.tablefmt))
 elif len(args.bots) == 1:
     info = [['Against','Draw', 'Win', 'Lose']]
-    for competitor in bots.bot_type.keys():
+    for competitor in bot_types.keys():
         if competitor == args.bots[0]:
             continue
         print(args.bots[0] + " vs. " + competitor)

@@ -53,10 +53,13 @@ import sys
 import Box2D
 from Box2D.b2 import (polygonShape, circleShape, staticBody, dynamicBody)
 from simulator import Simulator
-import bots.simple
-import bots.human
 import argparse
-from bots import bot_type, keyboard_listeners
+from bots import keyboard_listeners
+
+from bots import load_all_bots, get_bot_registry
+
+load_all_bots()
+bot_types = get_bot_registry()
 
 parser = argparse.ArgumentParser(prog='main', \
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -76,13 +79,13 @@ team1_name = args.team1
 team2_name = args.team2
  
 for name in args.bots:
-    if name not in bots.bot_type:
+    if name not in bot_types:
         print("'{}' isn't a registered bot class".format(name))
         parser.print_help()
         sys.exit(1)
 
 if len(args.bots) == 0:
-    player_names = ["PotentialWinner", "PotentialWinner", "SimpleBot2", "SimpleBot2"]
+    player_names = ["PotentialWinner", "PotentialWinner", "MicroInvadersPro", "MicroInvadersPro"]
 elif len(args.bots) == 2:
     player_names = [args.bots[0], args.bots[0], args.bots[1], args.bots[1]]
 elif len(args.bots) == 4:
@@ -171,7 +174,7 @@ def draw_scores(scores, red_core_counts):
 
 def create_controllers():
     keyboard_listeners.clear()
-    return [bot_type[player_names[i]](i) for i in range(4)]
+    return [bot_types[player_names[i]](i) for i in range(4)]
 
 controllers=create_controllers()
 
