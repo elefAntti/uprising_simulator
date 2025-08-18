@@ -1,0 +1,18 @@
+{
+  "candidate": "AegisPilot",
+  "gen": 14,
+  "score": 0.7636363636363637,
+  "datetime_utc": "20250818T085003Z",
+  "genome": {
+    "partner_repel_w": 1.1716897159454844,
+    "pair_repel_w": 0.5033783234550088,
+    "red_attr_w": 0.9247074641455226,
+    "green_attr_w": 0.681926270036142,
+    "wall_power": 6.941981693800911,
+    "wall_scale": 0.07549117372257376,
+    "sample_ahead": 0.02531097177135052,
+    "fd_step": 0.015012409432277711
+  },
+  "class": "AegisPilot",
+  "name": "AegisPilot@gen14_6a836b3d"
+}
