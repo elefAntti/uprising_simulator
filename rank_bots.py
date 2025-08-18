@@ -20,7 +20,15 @@ except Exception:
     tqdm = None
 
 from active_duel_ranker import ActiveDuelRanker
-from win_probabilities import simulate_game
+
+from bots import load_all_bots, get_bot_registry
+import bots.param_alias as PA
+from win_probabilities import simulate_game, set_bot_types
+
+load_all_bots()
+
+PA.autoload("zoo/**/*.json")
+set_bot_types(get_bot_registry())
 
 def make_duel_by_name(items, args):
     game_counter = {"k": 0}

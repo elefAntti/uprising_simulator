@@ -11,10 +11,12 @@ from bots import load_all_bots, get_bot_registry
 load_all_bots()
 bot_types = get_bot_registry()
 
+def set_bot_types(reg):
+    global bot_types
+    bot_types=reg
+
 def create_controllers(player_names):
     return [bot_types[player_names[i]](i) for i in range(4)]
-
-
 
 def _wrap_controllers_with_sensor_noise(controllers, pos_sigma=0.02, angle_sigma_rad=math.radians(2.0), rng=None):
     """Monkey-patch each controller.get_controls to add Gaussian sensor noise.
@@ -97,78 +99,83 @@ def win_probabilities(player_names, n_games, pos_sigma=0.02, angle_sigma_deg=2.0
     probs = [x / float(n_games) for x in winners]
     return probs
 
-parser = argparse.ArgumentParser(prog='win_probabilities', \
-    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('--games', type=int, default=200, help='How many games to simulate')
+def main():
+    parser = argparse.ArgumentParser(prog='win_probabilities', \
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--games', type=int, default=200, help='How many games to simulate')
 
-parser.add_argument('--sensor-pos-sigma', type=float, default=0.02, help='Std dev of position sensor noise (meters)')
-parser.add_argument('--sensor-angle-sigma-deg', type=float, default=2.0, help='Std dev of angle sensor noise (degrees)')
-parser.add_argument('--swap-sides-prob', type=float, default=0.5, help='Probability to swap sides (Team1 <-> Team2) each game')
-parser.add_argument('--seed', type=int, default=None, help='Base RNG seed for reproducible experiments')
+    parser.add_argument('--sensor-pos-sigma', type=float, default=0.02, help='Std dev of position sensor noise (meters)')
+    parser.add_argument('--sensor-angle-sigma-deg', type=float, default=2.0, help='Std dev of angle sensor noise (degrees)')
+    parser.add_argument('--swap-sides-prob', type=float, default=0.5, help='Probability to swap sides (Team1 <-> Team2) each game')
+    parser.add_argument('--seed', type=int, default=None, help='Base RNG seed for reproducible experiments')
 
-parser.add_argument('--tablefmt', type=str, default="fancy_grid", 
-    help='How to format the resulttable eg github, fancy_grid or latex. \
-        See https://pypi.org/project/tabulate/')
-parser.add_argument('bots', nargs='*', default=[], help='''\
-     0, 1, 2 or 4 bot names.
-     0: Play all bots against each other
-     1: Play all bots against the specified bot
-     2: Play the selected bots against each other (2 in each team)
-     4: Play the selected bots against each other
-     ''')
-args = parser.parse_args()
-n_games = args.games
+    parser.add_argument('--tablefmt', type=str, default="fancy_grid", 
+        help='How to format the resulttable eg github, fancy_grid or latex. \
+            See https://pypi.org/project/tabulate/')
+    parser.add_argument('bots', nargs='*', default=[], help='''\
+         0, 1, 2 or 4 bot names.
+         0: Play all bots against each other
+         1: Play all bots against the specified bot
+         2: Play the selected bots against each other (2 in each team)
+         4: Play the selected bots against each other
+         ''')
+    args = parser.parse_args()
+    n_games = args.games
 
-for name in args.bots:
-    if name not in bot_types:
-        print("'{}' isn't a registered bot class".format(name))
-        parser.print_help()
-        sys.exit(1)
+    for name in args.bots:
+        if name not in bot_types:
+            print("'{}' isn't a registered bot class".format(name))
+            parser.print_help()
+            sys.exit(1)
 
-if len(args.bots) == 0:
-    bot_names = list(bot_types.keys())
-    headers = ["Against"] + bot_names
-    results = [[name] + [ "x" for _ in bot_names ] for name in bot_names]
-    for i in range(len(bot_names)):
-        for j in range(i):
-            p1 = bot_names[i]
-            p2 = bot_names[j]
-            player_names = [p1, p1, p2, p2]
-            print(p1 + " vs. " + p2)
+    if len(args.bots) == 0:
+        bot_names = list(bot_types.keys())
+        headers = ["Against"] + bot_names
+        results = [[name] + [ "x" for _ in bot_names ] for name in bot_names]
+        for i in range(len(bot_names)):
+            for j in range(i):
+                p1 = bot_names[i]
+                p2 = bot_names[j]
+                player_names = [p1, p1, p2, p2]
+                print(p1 + " vs. " + p2)
+                probs = win_probabilities(player_names, n_games, pos_sigma=args.sensor_pos_sigma, angle_sigma_deg=args.sensor_angle_sigma_deg, swap_sides_prob=args.swap_sides_prob, base_seed=args.seed)
+                probstrings = ['{} \u00b1 {:.2f}'.format(prob, confidence_limit(prob, n_games))
+                    for prob in probs]
+                results[i][j + 1] = probstrings[1]
+                results[j][i + 1] = probstrings[2]
+                print(tabulate(results, headers=headers, tablefmt = args.tablefmt))
+    elif len(args.bots) == 1:
+        info = [['Against','Draw', 'Win', 'Lose']]
+        for competitor in bot_types.keys():
+            if competitor == args.bots[0]:
+                continue
+            print(args.bots[0] + " vs. " + competitor)
+            player_names = [args.bots[0], args.bots[0], competitor, competitor]
             probs = win_probabilities(player_names, n_games, pos_sigma=args.sensor_pos_sigma, angle_sigma_deg=args.sensor_angle_sigma_deg, swap_sides_prob=args.swap_sides_prob, base_seed=args.seed)
             probstrings = ['{} \u00b1 {:.2f}'.format(prob, confidence_limit(prob, n_games))
                 for prob in probs]
-            results[i][j + 1] = probstrings[1]
-            results[j][i + 1] = probstrings[2]
-            print(tabulate(results, headers=headers, tablefmt = args.tablefmt))
-elif len(args.bots) == 1:
-    info = [['Against','Draw', 'Win', 'Lose']]
-    for competitor in bot_types.keys():
-        if competitor == args.bots[0]:
-            continue
-        print(args.bots[0] + " vs. " + competitor)
-        player_names = [args.bots[0], args.bots[0], competitor, competitor]
+            info.append([competitor] + probstrings)
+            print(tabulate(info, headers='firstrow', tablefmt = args.tablefmt))
+    elif len(args.bots) == 2:
+        player_names = [args.bots[0], args.bots[0], args.bots[1], args.bots[1]]
         probs = win_probabilities(player_names, n_games, pos_sigma=args.sensor_pos_sigma, angle_sigma_deg=args.sensor_angle_sigma_deg, swap_sides_prob=args.swap_sides_prob, base_seed=args.seed)
-        probstrings = ['{} \u00b1 {:.2f}'.format(prob, confidence_limit(prob, n_games))
-            for prob in probs]
-        info.append([competitor] + probstrings)
-        print(tabulate(info, headers='firstrow', tablefmt = args.tablefmt))
-elif len(args.bots) == 2:
-    player_names = [args.bots[0], args.bots[0], args.bots[1], args.bots[1]]
-    probs = win_probabilities(player_names, n_games, pos_sigma=args.sensor_pos_sigma, angle_sigma_deg=args.sensor_angle_sigma_deg, swap_sides_prob=args.swap_sides_prob, base_seed=args.seed)
-    info = {'Result':['Draw', args.bots[0], args.bots[1]],
-            'Prob.': probs,
-            'Conf. Int.': [confidence_limit(probs[i], n_games) for i in range(3)]}
+        info = {'Result':['Draw', args.bots[0], args.bots[1]],
+                'Prob.': probs,
+                'Conf. Int.': [confidence_limit(probs[i], n_games) for i in range(3)]}
 
-    print(tabulate(info, headers='keys', tablefmt = args.tablefmt))
-elif len(args.bots) == 4:
-    player_names = args.bots
-    probs = win_probabilities(player_names, n_games, pos_sigma=args.sensor_pos_sigma, angle_sigma_deg=args.sensor_angle_sigma_deg, swap_sides_prob=args.swap_sides_prob, base_seed=args.seed)
-    info = {'Result':['Draw', 'Team 1', 'Team 2'],
-            'Prob.': probs,
-            'Conf. Int.': [confidence_limit(probs[i], n_games) for i in range(3)]}
+        print(tabulate(info, headers='keys', tablefmt = args.tablefmt))
+    elif len(args.bots) == 4:
+        player_names = args.bots
+        probs = win_probabilities(player_names, n_games, pos_sigma=args.sensor_pos_sigma, angle_sigma_deg=args.sensor_angle_sigma_deg, swap_sides_prob=args.swap_sides_prob, base_seed=args.seed)
+        info = {'Result':['Draw', 'Team 1', 'Team 2'],
+                'Prob.': probs,
+                'Conf. Int.': [confidence_limit(probs[i], n_games) for i in range(3)]}
 
-    print(tabulate(info, headers='keys', tablefmt = args.tablefmt))
-else:
-    parser.print_help()
-    sys.exit(1)
+        print(tabulate(info, headers='keys', tablefmt = args.tablefmt))
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
