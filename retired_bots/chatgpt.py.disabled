@@ -1,0 +1,4045 @@
+import math
+from collections import namedtuple
+from bots.utility_functions import *
+from utils.math_utils import * 
+from utils.velocity_estimate import Predictor
+from bots import register_bot
+from collections import deque
+
+ARENA_W, ARENA_H = 1.5, 1.5
+
+def smooth_drive_to_target(own_pos, own_dir, target, max_speed=1.0, turn_gain=1.9, slow_angle=math.radians(45)):
+    tx, ty = target
+    ox, oy = own_pos
+    dx, dy = tx - ox, ty - oy
+    if dx == 0.0 and dy == 0.0:
+        return [0.0, 0.0]
+    target_angle = math.atan2(dy, dx)
+    heading_error = (target_angle - own_dir + math.pi) % (2 * math.pi) - math.pi
+    align = max(0.0, math.cos(heading_error))
+    if abs(heading_error) > slow_angle:
+        align *= 0.5
+    fwd = max_speed * align
+    turn = turn_gain * heading_error
+    left = fwd - turn
+    right = fwd + turn
+    m = max(1.0, abs(left), abs(right))
+    return [left / m, right / m]
+
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+def perp(v): return (-v[1], v[0])
+def vadd(a,b): return (a[0]+b[0], a[1]+b[1])
+def vsub(a,b): return (a[0]-b[0], a[1]-b[1])
+def vmul(a,s): return (a[0]*s, a[1]*s)
+def vlen(a): return math.hypot(a[0], a[1])
+def vnorm(a): 
+    L = vlen(a)
+    return (0.0,0.0) if L==0 else (a[0]/L, a[1]/L)
+
+@register_bot
+class MicroInvadersPro:
+    """
+    Collision-aware version:
+      - Robot/Wall avoidance
+      - Oncoming yield (pass-right)
+      - Same-ball offsetting
+      - Stuck detection & escape
+    """
+    RED_THREAT_RADIUS = 0.45
+    APPROACH_OFFSET   = 0.12
+    RETAIN_TARGET_BONUS = 0.25
+
+    # Anti-collision
+    AVOID_RADIUS   = 0.18   # start steering away inside 18 cm
+    AVOID_GAIN     = 0.12
+    WALL_MARGIN    = 0.08
+    WALL_GAIN      = 0.15
+
+    # Oncoming yield
+    HEADON_RADIUS  = 0.25
+    YIELD_OFFSET   = 0.10    # lateral sidestep
+
+    # Stuck handling (assuming ~240 control calls/sec due to T_SCALE=4 and 60 FPS)
+    HIST_LEN       = 60      # ~0.25 s window
+    STUCK_SPEED    = 0.01    # <1 cm/s considered stalled
+    ESCAPE_TICKS   = 40      # ~0.17 s escape maneuver
+
+    def __init__(self, index):
+        self._index = index
+        self._target_kind = None
+        self._target_pos = None
+        self._target_id = None
+
+        self._hist = deque(maxlen=self.HIST_LEN)  # recent positions
+        self._escape_ticks = 0
+
+    def getWaitPosition(self):
+        if self._index in (0, 1):
+            return (0.30 if self._index % 2 == 0 else 0.55, 1.20)
+        else:
+            return (1.20, 0.30 if self._index % 2 == 0 else 0.55)
+
+    def _own_base(self):
+        return get_base_coords(self._index)
+
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0, 0.0), (ARENA_W, 0.0), (0.0, ARENA_H), (ARENA_W, ARENA_H)]
+        return max(corners, key=lambda c: vec_dist(c, (bx, by)))
+
+    def _id_of(self, pos): return (round(pos[0], 2), round(pos[1], 2))
+
+    def _approach_point(self, ball, goal, offset=None, lateral=0.0):
+        if offset is None: offset = self.APPROACH_OFFSET
+        bx, by = ball
+        gx, gy = goal
+        to_goal = vnorm((gx - bx, gy - by))
+        if to_goal == (0.0, 0.0): to_goal = (1.0, 0.0)
+        behind = (bx - to_goal[0]*offset, by - to_goal[1]*offset)
+        if lateral != 0.0:
+            side = perp(to_goal)
+            behind = (behind[0] + side[0]*lateral, behind[1] + side[1]*lateral)
+        return behind
+
+    def _utility_red(self, own, ball):
+        d_me    = max(0.05, vec_dist(own, ball))
+        d_own   = vec_dist(self._own_base(), ball)
+        d_enemy = vec_dist(self._enemy_base(), ball)
+        return (1.2 / (0.4 + d_enemy)) + (0.8 / (0.3 + d_own)) + (0.7 / (0.2 + d_me))
+
+    def _utility_green(self, own, ball):
+        d_me    = max(0.05, vec_dist(own, ball))
+        d_home  = vec_dist(self._own_base(), ball)
+        return (1.0 / (0.25 + d_me)) + (0.7 / (0.35 + d_home))
+
+    def _select_distinct(self, candidates):
+        if not candidates: return None
+        rank = 0 if (self._index % 2 == 0) else 1
+        return candidates[rank] if rank < len(candidates) else candidates[0]
+
+    # --- avoidance & traffic rules ---
+    def _avoidance_shift(self, own_pos, bot_coords):
+        # Robot separation
+        shift = (0.0, 0.0)
+        ox, oy = own_pos
+        for i, (pos, heading) in enumerate(bot_coords):
+            if i == self._index: continue
+            dx, dy = pos[0]-ox, pos[1]-oy
+            d = math.hypot(dx, dy)
+            if d < 1e-6: continue
+            if d < self.AVOID_RADIUS:
+                repel = vmul(vnorm((-dx, -dy)), self.AVOID_GAIN * (self.AVOID_RADIUS - d) / self.AVOID_RADIUS)
+                shift = vadd(shift, repel)
+
+        # Wall soft-repulsion
+        left = ox - 0.0
+        right = ARENA_W - ox
+        bottom = oy - 0.0
+        top = ARENA_H - oy
+        for dist, normal in [
+            (left,   (1.0, 0.0)),
+            (right,  (-1.0, 0.0)),
+            (bottom, (0.0, 1.0)),
+            (top,    (0.0, -1.0)),
+        ]:
+            if dist < self.WALL_MARGIN:
+                shift = vadd(shift, vmul(normal, self.WALL_GAIN * (self.WALL_MARGIN - dist) / self.WALL_MARGIN))
+        return shift
+
+    def _headon_yield_offset(self, own_pos, own_dir, bot_coords):
+        """Return lateral offset (+/-YIELD_OFFSET) to pass right if oncoming bot detected."""
+        ox, oy = own_pos
+        ovec = (math.cos(own_dir), math.sin(own_dir))
+        for i, (pos, heading) in enumerate(bot_coords):
+            if i == self._index: continue
+            dx, dy = pos[0]-ox, pos[1]-oy
+            d = math.hypot(dx, dy)
+            if d > self.HEADON_RADIUS or d < 1e-6: continue
+            other_vec = (math.cos(heading), math.sin(heading))
+            # approaching each other? relative dot negative both ways
+            if (dx*ovec[0] + dy*ovec[1]) > 0 and (-dx*other_vec[0] - dy*other_vec[1]) > 0:
+                # deterministic tie-break: lower index yields right, higher goes straight
+                if self._index % 2 == 1:
+                    return self.YIELD_OFFSET   # odd index sidestep to its right
+                else:
+                    return 0.0
+        return 0.0
+
+    def _stuck_update_and_check(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen:
+            return False
+        # average speed ~ path length / window duration (we only need a crude test)
+        dist = 0.0
+        prev = None
+        for p in self._hist:
+            if prev is not None:
+                dist += vlen(vsub(p, prev))
+            prev = p
+        avg_step = dist / max(1, len(self._hist)-1)
+        return avg_step < self.STUCK_SPEED
+
+    def _escape_controls(self, own_dir):
+        # Reverse with a gentle turn; odd/even choose opposite spins to separate
+        turn_sign = -1.0 if (self._index % 2 == 0) else 1.0
+        left = -0.5 - 0.4 * turn_sign
+        right = -0.5 + 0.4 * turn_sign
+        return [clamp(left, -1, 1), clamp(right, -1, 1)]
+
+    # ---- main policy ----
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+
+        # Stuck detection / escape
+        if self._escape_ticks > 0:
+            self._escape_ticks -= 1
+            self._hist.clear()  # don't immediately re-trigger
+            return self._escape_controls(own_dir)
+
+        if self._stuck_update_and_check(own_pos):
+            self._escape_ticks = self.ESCAPE_TICKS
+            return self._escape_controls(own_dir)
+
+        # 1) Emergency defense vs reds near base
+        threats = [r for r in red_coords if vec_dist(own_base, r) <= self.RED_THREAT_RADIUS]
+        if threats:
+            ball = min(threats, key=lambda r: vec_dist(own_base, r))
+            lateral = self._headon_yield_offset(own_pos, own_dir, bot_coords)
+            approach = self._approach_point(ball, enemy_base, lateral=lateral)
+            approach = vadd(approach, self._avoidance_shift(own_pos, bot_coords))
+            self._target_kind, self._target_pos, self._target_id = 'red', ball, self._id_of(ball)
+            return smooth_drive_to_target(own_pos, own_dir, approach)
+
+        # 2) Score reds if possible; else best green
+        reds = [(self._utility_red(own_pos, r), r, 'red') for r in red_coords]
+        reds.sort(key=lambda t: t[0], reverse=True)
+        greens = [(self._utility_green(own_pos, g), g, 'green') for g in green_coords]
+        greens.sort(key=lambda t: t[0], reverse=True)
+        candidates = reds[:3] + greens[:3]
+        if candidates:
+            # pick distinct target
+            rank = 0 if (self._index % 2 == 0) else 1
+            util, ball, kind = candidates[rank] if rank < len(candidates) else candidates[0]
+
+            # Hysteresis: prefer staying on current task
+            if self._target_pos is not None and self._target_kind is not None:
+                if self._target_kind == kind:
+                    prev_d = vec_dist(own_pos, self._target_pos)
+                    new_d = vec_dist(own_pos, ball)
+                    if new_d > max(0.05, prev_d - self.RETAIN_TARGET_BONUS):
+                        ball, kind = self._target_pos, self._target_kind
+                elif self._target_kind == 'red' and kind == 'green':
+                    if vec_dist(own_pos, ball) > vec_dist(own_pos, self._target_pos) - self.RETAIN_TARGET_BONUS:
+                        ball, kind = self._target_pos, 'red'
+
+            # If teammate likely going for same ball, odd-index takes lateral offset
+            lateral = 0.0
+            if self._index % 2 == 1:
+                # crude same-ball check by proximity to teammate targets/positions
+                # (teammate is index ^1 within team)
+                mate_idx = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+                mate_pos, _ = bot_coords[mate_idx]
+                if vec_dist(mate_pos, ball) < 0.35:
+                    lateral = self.YIELD_OFFSET
+
+            # Add oncoming-yield and avoidance
+            lateral += self._headon_yield_offset(own_pos, own_dir, bot_coords)
+            approach = self._approach_point(ball, enemy_base if kind=='red' else own_base, lateral=lateral)
+            approach = vadd(approach, self._avoidance_shift(own_pos, bot_coords))
+
+            self._target_kind, self._target_pos, self._target_id = kind, ball, self._id_of(ball)
+            return smooth_drive_to_target(own_pos, own_dir, approach)
+
+        # 3) Idle: park with avoidance so we don't camp in corners
+        park = vadd(self.getWaitPosition(), self._avoidance_shift(own_pos, bot_coords))
+        self._target_kind = self._target_pos = self._target_id = None
+        return smooth_drive_to_target(own_pos, own_dir, park)
+
+
+@register_bot
+class GreenRush:
+    """
+    Win-fast plan for 30s rounds:
+      - Even index = Striker: always chase/scoring greens.
+      - Odd index  = Sweeper: score greens; only clear a red if it's truly threatening our base.
+    Key behaviors:
+      - Hard lock-on to a single ball (no chattering).
+      - Behind-the-ball approach, then push-through to a point *inside* base.
+      - Tiny separation/wall nudges to avoid sticking, but no big avoidance (keeps paths decisive).
+    """
+    # Base geometry heuristic (center + push-through vector)
+    BASE_HALF = 0.20         # ~ BASE_SIZE/2 (0.4/2)
+    PUSH_IN   = 0.07         # extra push depth inside base
+
+    # Ball handling
+    APPROACH_OFFSET = 0.08   # standoff behind ball
+    CAPTURE_R       = 0.07  # consider we "have" the ball
+    LOCK_TOL        = 0.06   # ball still "same" if within this of last lock
+
+    # Selection / switching
+    LOCK_MARGIN     = 0.25   # new plan must beat current by this distance
+    ENEMY_HELP_RED  = False  # ignore offensive reds (30s is too short for 3)
+
+    # Threat handling
+    THREAT_R        = 0.28   # red threatens our base if within this of base center
+
+    # Light separation so teammates don't glue
+    SEP_RADIUS      = 0.18
+    SEP_GAIN        = 0.10
+    WALL_M          = 0.06
+
+    # Stuck recovery
+    HIST_N          = 28
+    STUCK_STEP_MIN  = 0.004
+    ESCAPE_TICKS    = 24
+
+    def __init__(self, index):
+        self._index = index
+        self._is_striker = (index % 2 == 0)
+        self._lock_kind = None   # 'green' or 'red'
+        self._lock_pos = None
+        self._push_mode = False
+        self._hist = deque(maxlen=self.HIST_N)
+        self._escape = 0
+
+    # --- geometry helpers ---
+    def _own_base(self):
+        return get_base_coords(self._index)
+
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0, 0.0), (ARENA_W, 0.0), (0.0, ARENA_H), (ARENA_W, ARENA_H)]
+        return max(corners, key=lambda c: vec_dist(c, (bx, by)))
+
+    def _base_center_and_inward(self, base):
+        bx, by = base
+        # Decide inward directions by which side of the arena the base sits
+        dx = self.BASE_HALF if bx < ARENA_W/2 else -self.BASE_HALF
+        dy = -self.BASE_HALF if by > ARENA_H/2 else self.BASE_HALF
+        center = (bx + dx, by + dy)
+        inward = vnorm((dx, dy))
+        # overshoot deeper into base for robust scoring
+        push_point = (center[0] + inward[0]*self.PUSH_IN, center[1] + inward[1]*self.PUSH_IN)
+        return center, inward, push_point
+
+    def _approach_point(self, ball, goal_point, lateral=0.0):
+        to_goal = vnorm((goal_point[0] - ball[0], goal_point[1] - ball[1]))
+        if to_goal == (0.0, 0.0): to_goal = (1.0, 0.0)
+        behind = (ball[0] - to_goal[0]*self.APPROACH_OFFSET, ball[1] - to_goal[1]*self.APPROACH_OFFSET)
+        if lateral != 0.0:
+            side = perp(to_goal)
+            behind = (behind[0] + side[0]*lateral, behind[1] + side[1]*lateral)
+        return behind
+
+    # --- tiny nudges (teammate + walls) ---
+    def _nudge(self, own_pos, bot_coords):
+        ox, oy = own_pos
+        n = (0.0, 0.0)
+        # teammate index (xor 1 within team)
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = vec_dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = vnorm(vsub(own_pos, mate_pos))
+                n = vadd(n, vmul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        # gentle wall push
+        left = ox; right = ARENA_W - ox; bottom = oy; top = ARENA_H - oy
+        if left < self.WALL_M:   n = vadd(n, ( self.SEP_GAIN*(self.WALL_M-left)/self.WALL_M, 0.0))
+        if right < self.WALL_M:  n = vadd(n, (-self.SEP_GAIN*(self.WALL_M-right)/self.WALL_M, 0.0))
+        if bottom < self.WALL_M: n = vadd(n, (0.0,  self.SEP_GAIN*(self.WALL_M-bottom)/self.WALL_M))
+        if top < self.WALL_M:    n = vadd(n, (0.0, -self.SEP_GAIN*(self.WALL_M-top)/self.WALL_M))
+        return n
+
+    # --- costs (lower is better) ---
+    def _green_cost(self, own, ball, goal_point):
+        ap = self._approach_point(ball, goal_point)
+        return vec_dist(own, ap) + 0.6*vec_dist(ball, goal_point)
+
+    # --- lock helpers ---
+    def _refresh_lock_if_present(self, balls):
+        if self._lock_pos is None: return False
+        near = [b for b in balls if vec_dist(b, self._lock_pos) <= self.LOCK_TOL]
+        if not near: return False
+        self._lock_pos = min(near, key=lambda b: vec_dist(b, self._lock_pos))
+        return True
+
+    # --- stuck handling ---
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0
+        prev = None
+        for p in self._hist:
+            if prev is not None:
+                dist += vec_dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [clamp(-0.55 - 0.35*s, -1, 1), clamp(-0.55 + 0.35*s, -1, 1)]
+
+    # --- main ---
+    def getWaitPosition(self):
+        # simple loiter away from corners
+        if self._index < 2:
+            return (0.42, 1.10)
+        else:
+            return (1.10, 0.42)
+
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        base_center, inward, push_point = self._base_center_and_inward(own_base)
+
+        # Stuck recovery
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # Sweeper: only clear a red if it's actually threatening our base
+        if (not self._is_striker):
+            threats = [r for r in red_coords if vec_dist(r, base_center) <= self.THREAT_R]
+            if threats:
+                # clear closest threat by pushing it *away* from our base (toward enemy)
+                red = min(threats, key=lambda r: vec_dist(r, base_center))
+                ap = self._approach_point(red, self._enemy_base())
+                tgt = vadd(ap, self._nudge(own_pos, bot_coords))
+                self._lock_kind, self._lock_pos, self._push_mode = 'red', red, False
+                return smooth_drive_to_target(own_pos, own_dir, tgt)
+
+        # Prefer greens: lock one if we don't have one
+        if self._lock_kind != 'green' or not self._refresh_lock_if_present(green_coords):
+            # rank greens by approach+finish cost
+            ranked = sorted(green_coords, key=lambda g: self._green_cost(own_pos, g, base_center))
+            if ranked:
+                # simple anti-dogpile: even index takes 0, odd takes 1 if exists
+                choice = ranked[0 if (self._index % 2 == 0) else min(1, len(ranked)-1)]
+                # only switch if clearly better than current plan
+                if self._lock_kind != 'green' or self._lock_pos is None:
+                    self._lock_kind, self._lock_pos, self._push_mode = 'green', choice, False
+                else:
+                    cur_cost = self._green_cost(own_pos, self._lock_pos, base_center)
+                    new_cost = self._green_cost(own_pos, choice, base_center)
+                    if new_cost + self.LOCK_MARGIN < cur_cost:
+                        self._lock_kind, self._lock_pos, self._push_mode = 'green', choice, False
+            else:
+                # No greens: fall back to nearest red *only if* not far from enemy base (bonus points unlikely)
+                if self.ENEMY_HELP_RED and red_coords:
+                    red = min(red_coords, key=lambda r: vec_dist(r, enemy_base))
+                    self._lock_kind, self._lock_pos, self._push_mode = 'red', red, False
+                else:
+                    # idle
+                    park = vadd(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+                    return smooth_drive_to_target(own_pos, own_dir, park)
+
+        # If we have a target, execute approach/push
+        if self._lock_pos is not None:
+            target_kind = self._lock_kind
+            goal_point = base_center if target_kind == 'green' else enemy_base
+
+            # Enter push mode when close to ball
+            if (not self._push_mode) and (vec_dist(own_pos, self._lock_pos) <= self.CAPTURE_R):
+                self._push_mode = True
+
+            if target_kind == 'green':
+                target = push_point if self._push_mode else self._approach_point(self._lock_pos, goal_point)
+            else:
+                # defensive red clear: just approach and shove away
+                target = self._approach_point(self._lock_pos, goal_point)
+
+            target = vadd(target, self._nudge(own_pos, bot_coords))
+            return smooth_drive_to_target(own_pos, own_dir, target)
+
+        # Fallback
+        park = vadd(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+        return smooth_drive_to_target(own_pos, own_dir, park)
+
+
+@register_bot
+class PointPusher:
+    """
+    Decisive, low-oscillation scorer:
+      - Both bots rush greens; odd index (1,3) only clears reds if they threaten our base.
+      - Simple state machine: APPROACH -> PUSH (no chattering).
+      - Rotate-in-place until roughly aligned, then drive forward (prevents wiggle).
+      - Minimal teammate/wall nudges to avoid glue without dithering.
+    """
+
+    # --- Tunables ---
+    APPROACH_OFFSET = 0.09          # stand-off behind ball (m)
+    CAPTURE_R       = 0.060         # within -> start PUSH mode (m)
+    ALIGN_PUSH      = 25 * 3.1415926535/180.0  # need this alignment to begin PUSH
+    ALIGN_TURN_ONLY = 70 * 3.1415926535/180.0  # if worse than this -> stop forward, turn-in-place
+    THREAT_R        = 0.28          # red considered a base threat (m)
+
+    # Steering
+    TURN_GAIN       = 1.75          # smaller -> fewer oscillations
+    MAX_SPEED       = 1.0
+
+    # Selection
+    LOCK_MARGIN     = 0.20          # new plan must beat current by this much (m)
+
+    # Gentle separation/walls
+    SEP_RADIUS      = 0.18
+    SEP_GAIN        = 0.08
+    WALL_M          = 0.06
+
+    # Stuck recovery
+    HIST_N          = 28
+    STUCK_STEP_MIN  = 0.0035
+    ESCAPE_TICKS    = 22
+
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._index = index
+        self._is_sweeper = (index % 2 == 1)     # odd index sweeps red threats
+        self._lock_kind = None                  # 'green' or 'red'
+        self._lock_pos = None
+        self._push_mode = False
+        self._hist = deque(maxlen=self.HIST_N)
+        self._escape = 0
+        self._math = math  # cache
+
+    # ------------- tiny vector utils (class-local) -------------
+    def _vadd(self, a, b): return (a[0]+b[0], a[1]+b[1])
+    def _vsub(self, a, b): return (a[0]-b[0], a[1]-b[1])
+    def _vmul(self, a, s): return (a[0]*s, a[1]*s)
+    def _vlen(self, a): m=self._math; return m.hypot(a[0], a[1])
+    def _vnorm(self, a):
+        L = self._vlen(a)
+        return (0.0,0.0) if L==0 else (a[0]/L, a[1]/L)
+    def _perp(self, a): return (-a[1], a[0])
+    def _dist(self, a, b): return self._vlen(self._vsub(a, b))
+    def _clamp(self, x, lo, hi): 
+        return lo if x < lo else hi if x > hi else x
+
+    # ------------- geometry helpers -------------
+    def _own_base(self):
+        return get_base_coords(self._index)
+
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0, 0.0), (self.ARENA_W, 0.0), (0.0, self.ARENA_H), (self.ARENA_W, self.ARENA_H)]
+        # farthest corner from our base
+        return max(corners, key=lambda c: self._dist(c, (bx, by)))
+
+    def _inward_point_in_base(self, base):
+        """A robust push target inside our base: step from base toward arena center."""
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        inward = self._vnorm((cx - base[0], cy - base[1]))
+        # 0.25 m along diagonal keeps us safely inside 0.4 m-square base
+        return self._vadd(base, self._vmul(inward, 0.25)), inward
+
+    def _approach_point(self, ball, goal_point):
+        to_goal = self._vnorm(self._vsub(goal_point, ball))
+        if to_goal == (0.0, 0.0): to_goal = (1.0, 0.0)
+        return self._vadd(ball, self._vmul(to_goal, -self.APPROACH_OFFSET)), to_goal
+
+    # ------------- controller (no external helpers) -------------
+    def _drive(self, own_pos, own_dir, target):
+        m = self._math
+        dx, dy = target[0]-own_pos[0], target[1]-own_pos[1]
+        if dx == 0.0 and dy == 0.0:
+            return [0.0, 0.0]
+        t_ang = m.atan2(dy, dx)
+        err = (t_ang - own_dir + m.pi) % (2*m.pi) - m.pi
+
+        # If badly misaligned: stop forward and just turn
+        if abs(err) > self.ALIGN_TURN_ONLY:
+            fwd = 0.0
+        else:
+            fwd = self.MAX_SPEED * max(0.0, m.cos(err))  # faster when aligned
+
+        turn = self.TURN_GAIN * err
+        left = fwd - turn
+        right = fwd + turn
+        mag = max(1.0, abs(left), abs(right))
+        return [left/mag, right/mag]
+
+    # ------------- selection / scoring -------------
+    def _green_cost(self, own_pos, g, base_point):
+        ap, _ = self._approach_point(g, base_point)
+        # favor close approach; lightly penalize ball->base distance
+        return self._dist(own_pos, ap) + 0.5 * self._dist(g, base_point)
+
+    def _rank_greens(self, own_pos, greens, base_point):
+        ranked = sorted(greens, key=lambda g: self._green_cost(own_pos, g, base_point))
+        if not ranked:
+            return None
+        # simple anti-dogpile: even takes best, odd takes second if available
+        pick_idx = 0 if (self._index % 2 == 0) else min(1, len(ranked)-1)
+        return ranked[pick_idx]
+
+    # ------------- nudges -------------
+    def _nudge(self, own_pos, bot_coords):
+        # teammate only
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        n = (0.0, 0.0)
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = self._dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = self._vnorm(self._vsub(own_pos, mate_pos))
+                n = self._vadd(n, self._vmul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        # wall nudge
+        x, y = own_pos
+        if x < self.WALL_M:   n = self._vadd(n, ( self.SEP_GAIN*(self.WALL_M-x)/self.WALL_M, 0.0))
+        if self.ARENA_W - x < self.WALL_M: n = self._vadd(n, (-self.SEP_GAIN*(self.WALL_M-(self.ARENA_W-x))/self.WALL_M, 0.0))
+        if y < self.WALL_M:   n = self._vadd(n, (0.0,  self.SEP_GAIN*(self.WALL_M-y)/self.WALL_M))
+        if self.ARENA_H - y < self.WALL_M: n = self._vadd(n, (0.0, -self.SEP_GAIN*(self.WALL_M-(self.ARENA_H-y))/self.WALL_M))
+        return n
+
+    # ------------- stuck handling -------------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen:
+            return False
+        dist = 0.0
+        prev = None
+        for p in self._hist:
+            if prev is not None:
+                dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+
+    def _escape_controls(self):
+        # reverse + small spin (even/odd opposite)
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        left = self._clamp(-0.55 - 0.30*s, -1, 1)
+        right = self._clamp(-0.55 + 0.30*s, -1, 1)
+        return [left, right]
+
+    # ------------- idling -------------
+    def getWaitPosition(self):
+        # keep away from corners, mirrored per team
+        if self._index < 2:
+            return (0.42, 1.08)
+        else:
+            return (1.08, 0.42)
+
+    # ------------- main -------------
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        m = self._math
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        base_point, inward = self._inward_point_in_base(own_base)
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # SWEEPER: clear *threatening* reds
+        if self._is_sweeper and red_coords:
+            # compute base center for threat measure
+            base_center = self._vadd(own_base, self._vmul(inward, 0.20))
+            threats = [r for r in red_coords if self._dist(r, base_center) <= self.THREAT_R]
+            if threats:
+                red = min(threats, key=lambda r: self._dist(r, base_center))
+                ap, _ = self._approach_point(red, enemy_base)  # push away from us
+                ap = self._vadd(ap, self._nudge(own_pos, bot_coords))
+                self._lock_kind, self._lock_pos, self._push_mode = 'red', red, False
+                return self._drive(own_pos, own_dir, ap)
+
+        # Acquire/maintain GREEN lock
+        if self._lock_kind != 'green' or self._lock_pos is None:
+            cand = self._rank_greens(own_pos, green_coords, base_point)
+            if cand is not None:
+                self._lock_kind, self._lock_pos, self._push_mode = 'green', cand, False
+        else:
+            # keep lock if it's still near previous place; otherwise consider switching
+            # find same ball (within 6 cm)
+            same = None
+            for g in green_coords:
+                if self._dist(g, self._lock_pos) <= 0.06:
+                    same = g
+                    break
+            if same is not None:
+                self._lock_pos = same
+            else:
+                # consider best new green, switch only if clearly better
+                new_cand = self._rank_greens(own_pos, green_coords, base_point)
+                if new_cand is not None:
+                    cur_cost = self._green_cost(own_pos, self._lock_pos, base_point)
+                    new_cost = self._green_cost(own_pos, new_cand, base_point)
+                    if new_cost + self.LOCK_MARGIN < cur_cost:
+                        self._lock_pos = new_cand
+                        self._push_mode = False
+
+        # Execute plan
+        if self._lock_kind == 'green' and self._lock_pos is not None:
+            # Enter push mode when close and roughly aligned with ball->base direction
+            if not self._push_mode:
+                ap, ball_to_goal = self._approach_point(self._lock_pos, base_point)
+                # Check alignment between robot heading and ball->goal
+                desired_ang = m.atan2(ball_to_goal[1], ball_to_goal[0])
+                err = (desired_ang - own_dir + m.pi) % (2*m.pi) - m.pi
+                if self._dist(own_pos, self._lock_pos) <= self.CAPTURE_R and abs(err) <= self.ALIGN_PUSH:
+                    self._push_mode = True
+
+            target = None
+            if self._push_mode:
+                # push through to a point inside base (a bit deeper than center)
+                push_point = self._vadd(base_point, self._vmul(inward, 0.07))
+                target = self._vadd(push_point, self._nudge(own_pos, bot_coords))
+            else:
+                ap, _ = self._approach_point(self._lock_pos, base_point)
+                target = self._vadd(ap, self._nudge(own_pos, bot_coords))
+
+            return self._drive(own_pos, own_dir, target)
+
+        # Fallback: idle
+        park = self._vadd(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+        return self._drive(own_pos, own_dir, park)
+
+
+@register_bot
+class EgressSplit:
+    """
+    Anti-dogpile + post-score egress bot.
+
+    Goals:
+      • Split targets deterministically so teammates don’t chase the same ball.
+      • Push cleanly, then EXIT the goal area via a lateral “egress” to avoid getting stuck.
+      • Ignore offensive reds (too slow for 30s); odd index only clears truly threatening reds.
+
+    States (implicit):
+      - APPROACH: drive to behind-ball point (relative to goal).
+      - PUSH: when close & roughly aligned, push through.
+      - EGRESS: after a delivery or if we enter a goal box, peel out along the goal’s tangent for a short time.
+    """
+
+    # --- Arena & base geometry ---
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+    BASE_MARGIN = 0.06        # no-go expansion around enemy base to avoid driving in
+
+    # --- Handling ---
+    APPROACH_OFFSET = 0.095   # stand-off behind ball
+    CAPTURE_R       = 0.062   # enter push when within this of ball
+    ALIGN_PUSH_DEG  = 28.0    # require this alignment to push
+    ALIGN_TURN_ONLY = 72.0    # if worse than this, rotate in place (no forward)
+
+    # --- Controller (kept gentle to avoid oscillation) ---
+    TURN_GAIN = 1.60
+    MAX_SPEED = 1.0
+
+    # --- Task selection ---
+    LOCK_TOL     = 0.06       # same-ball tolerance (meters)
+    LOCK_MARGIN  = 0.22       # new plan must beat current by this many meters
+    THREAT_R     = 0.28       # red threatens our base if within this of base center
+
+    # --- Team separation / walls (lightweight, non-dithery) ---
+    SEP_RADIUS = 0.18
+    SEP_GAIN   = 0.07
+    WALL_M     = 0.06
+
+    # --- Egress after delivery / goal entry ---
+    EGRESS_TICKS = 45         # ~0.19 s @ 240Hz control
+    EGRESS_SIDE  = 0.18       # lateral slide along goal mouth
+    EGRESS_OUT   = 0.08       # small outward step to leave box
+
+    # --- Stuck recovery ---
+    HIST_N         = 28
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS   = 24
+
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._index = index
+        self._is_sweeper = (index % 2 == 1)  # odd index = red-threat sweeper
+        self._lock_kind = None               # 'green' or 'red'
+        self._lock_pos  = None
+        self._push_mode = False
+        self._egress_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+        self._m = math
+
+    # -------- vector utils --------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a)
+        return (0.0,0.0) if L==0 else (a[0]/L, a[1]/L)
+    def _perp(self,a): return (-a[1], a[0])
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp(self,x,lo,hi): return lo if x<lo else hi if x>hi else x
+
+    # -------- base geometry helpers --------
+    def _own_base(self):
+        return get_base_coords(self._index)
+
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0), (self.ARENA_W,0.0), (0.0,self.ARENA_H), (self.ARENA_W,self.ARENA_H)]
+        # enemy is farthest corner from ours
+        return max(corners, key=lambda c: self._dist(c, (bx,by)))
+
+    def _base_axes(self, corner):
+        """Return inwards unit axes (+x_in, +y_in) from a base corner toward arena center."""
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        # axes are axis-aligned (base is axis-aligned square)
+        return (ix, 0.0), (0.0, iy)
+
+    def _base_rect(self, corner, margin=0.0):
+        """Axis-aligned rectangle of a base (possibly expanded by margin), returned as (xmin,xmax,ymin,ymax)."""
+        ax, ay = self._base_axes(corner)
+        # far edge point
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        # base center is 0.5 * BASE_SIZE along each axis
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+
+    # -------- scoring & approach helpers --------
+    def _approach_point(self, ball, goal_point):
+        """Behind-ball point relative to a goal point."""
+        to_goal = self._norm(self._sub(goal_point, ball))
+        if to_goal == (0.0,0.0): to_goal = (1.0,0.0)
+        return self._add(ball, self._mul(to_goal, -self.APPROACH_OFFSET)), to_goal
+
+    def _green_cost(self, own_pos, g, own_base_corner):
+        # aim at base center for cost; actual push goes to push_point
+        center = self._base_center(own_base_corner)
+        ap, _ = self._approach_point(g, center)
+        return self._dist(own_pos, ap) + 0.55 * self._dist(g, center)
+
+    def _rank_greens_for(self, pos, greens, own_base_corner):
+        return sorted(greens, key=lambda g: self._green_cost(pos, g, own_base_corner))
+
+    def _predict_mate_pick(self, bot_coords, greens, own_base_corner):
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if not (0 <= mate < len(bot_coords)): return None
+        mate_pos, _ = bot_coords[mate]
+        rg = self._rank_greens_for(mate_pos, greens, own_base_corner)
+        if not rg: return None
+        # mate uses same rule: even takes best, odd takes second if exists
+        pick_idx = 0 if (mate % 2 == 0) else min(1, len(rg)-1)
+        return rg[pick_idx]
+
+    # -------- controller --------
+    def _drive_to(self, own_pos, own_dir, target):
+        dx, dy = target[0]-own_pos[0], target[1]-own_pos[1]
+        if dx == 0.0 and dy == 0.0:
+            return [0.0, 0.0]
+        t_ang = self._m.atan2(dy, dx)
+        err = (t_ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+        # rotate-in-place when badly misaligned
+        if abs(err) > self._m.radians(self.ALIGN_TURN_ONLY):
+            fwd = 0.0
+        else:
+            fwd = self.MAX_SPEED * max(0.0, self._m.cos(err))
+        turn = self.TURN_GAIN * err
+        left = fwd - turn
+        right = fwd + turn
+        mag = max(1.0, abs(left), abs(right))
+        return [left/mag, right/mag]
+
+    # -------- small nudges (mate + walls) --------
+    def _nudge(self, own_pos, bot_coords):
+        n = (0.0, 0.0)
+        # teammate only
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = self._dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = self._norm(self._sub(own_pos, mate_pos))
+                n = self._add(n, self._mul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        # walls
+        x, y = own_pos
+        if x < self.WALL_M: n = self._add(n, ( self.SEP_GAIN*(self.WALL_M-x)/self.WALL_M, 0.0))
+        if self.ARENA_W - x < self.WALL_M: n = self._add(n, (-self.SEP_GAIN*(self.WALL_M-(self.ARENA_W-x))/self.WALL_M, 0.0))
+        if y < self.WALL_M: n = self._add(n, (0.0,  self.SEP_GAIN*(self.WALL_M-y)/self.WALL_M))
+        if self.ARENA_H - y < self.WALL_M: n = self._add(n, (0.0, -self.SEP_GAIN*(self.WALL_M-(self.ARENA_H-y))/self.WALL_M))
+        return n
+
+    # -------- stuck & egress handling --------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0
+        prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp(-0.55 - 0.30*s, -1, 1), self._clamp(-0.55 + 0.30*s, -1, 1)]
+
+    def _start_egress(self, own_base_corner, enemy=False):
+        """Enter egress for a short burst; choose side by index to avoid both taking same line."""
+        self._egress_ticks = self.EGRESS_TICKS
+        self._push_mode = False
+        # store which base we’re egressing from
+        self._egress_from_enemy = enemy
+        self._egress_base = self._enemy_base() if enemy else own_base_corner
+
+    def _egress_target(self):
+        """Compute a lateral + outward target from the active goal mouth."""
+        corner = self._egress_base
+        ax, ay = self._base_axes(corner)           # axis-aligned inward directions
+        inward = self._norm(self._add(ax, ay))     # diagonal into the base
+        # tangent (choose left/right by index parity)
+        tangent = self._perp(inward)
+        side = -1.0 if (self._index % 2 == 0) else 1.0
+        center = self._base_center(corner)
+        # step a bit along tangent and outward (opposite of inward)
+        out = self._mul(inward, -self.EGRESS_OUT)
+        tgt = self._add(center, self._add(self._mul(tangent, side*self.EGRESS_SIDE), out))
+        return tgt
+
+    # -------- utility --------
+    def _same_ball(self, a, b):
+        return self._dist(a, b) <= self.LOCK_TOL
+
+    def getWaitPosition(self):
+        # mild mid-field loiter away from corners
+        if self._index < 2:
+            return (0.48, 1.08)
+        else:
+            return (1.08, 0.48)
+
+    # ================== MAIN ==================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # EGRESS handling
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            target = self._add(self._egress_target(), self._nudge(own_pos, bot_coords))
+            return self._drive_to(own_pos, own_dir, target)
+
+        # --- Sweeper clears red threats near OUR base (only if truly close) ---
+        if self._is_sweeper and red_coords:
+            base_c = self._base_center(own_base)
+            threats = [r for r in red_coords if self._dist(r, base_c) <= self.THREAT_R]
+            if threats:
+                # push away from our base (toward arena center)
+                center = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+                red = min(threats, key=lambda r: self._dist(r, base_c))
+                ap, _ = self._approach_point(red, center)
+                tgt = self._add(ap, self._nudge(own_pos, bot_coords))
+                self._lock_kind, self._lock_pos, self._push_mode = 'red', red, False
+                return self._drive_to(own_pos, own_dir, tgt)
+
+        # --- Prefer GREENS. Split targets deterministically. ---
+        # Predict mate's pick and avoid it if possible.
+        predicted_mate = self._predict_mate_pick(bot_coords, green_coords, own_base)
+        ranked = self._rank_greens_for(own_pos, green_coords, own_base)
+        choice = None
+        if ranked:
+            if predicted_mate is not None:
+                # pick best that isn't mate's predicted choice
+                for g in ranked:
+                    if not self._same_ball(g, predicted_mate):
+                        choice = g; break
+                if choice is None:
+                    choice = ranked[0]  # fall back
+            else:
+                # even -> best; odd -> second if exists
+                choice = ranked[0 if (self._index % 2 == 0) else min(1, len(ranked)-1)]
+
+        # Acquire/maintain lock
+        if self._lock_kind != 'green' or self._lock_pos is None:
+            if choice is not None:
+                self._lock_kind, self._lock_pos, self._push_mode = 'green', choice, False
+        else:
+            # refresh if same ball still present; else consider switching only if much better
+            same = None
+            for g in green_coords:
+                if self._same_ball(g, self._lock_pos):
+                    same = g; break
+            if same is not None:
+                self._lock_pos = same
+            elif choice is not None:
+                # switch only if clearly better
+                cur_cost = self._green_cost(own_pos, self._lock_pos, own_base)
+                new_cost = self._green_cost(own_pos, choice, own_base)
+                if new_cost + self.LOCK_MARGIN < cur_cost:
+                    self._lock_pos, self._push_mode = choice, False
+            else:
+                # no greens -> idle (we ignore offensive reds to avoid opponent-goal camping)
+                park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+                return self._drive_to(own_pos, own_dir, park)
+
+        # --- Execute approach / push for GREENS ---
+        if self._lock_kind == 'green' and self._lock_pos is not None:
+            # Compute robust push-through target inside our base center, but we will EGRESS after we get in.
+            base_c = self._base_center(own_base)
+            ap, ball_to_goal = self._approach_point(self._lock_pos, base_c)
+
+            # enter push when close & aligned
+            desired = self._m.atan2(ball_to_goal[1], ball_to_goal[0])
+            err = (desired - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+            if (not self._push_mode) and (self._dist(own_pos, self._lock_pos) <= self.CAPTURE_R) and (abs(err) <= self._m.radians(self.ALIGN_PUSH_DEG)):
+                self._push_mode = True
+
+            # If we accidentally end up inside ENEMY base, immediately start egress-from-enemy
+            exmin, exmax, eymin, eymax = self._base_rect(enemy_base, margin=self.BASE_MARGIN)
+            if (exmin <= own_pos[0] <= exmax) and (eymin <= own_pos[1] <= eymax):
+                self._start_egress(own_base, enemy=True)
+
+            # If we are inside OUR base while pushing -> start egress soon (avoid lingering)
+            oxmin, oxmax, oymin, oymax = self._base_rect(own_base, margin=0.0)
+            if self._push_mode and (oxmin <= own_pos[0] <= oxmax) and (oymin <= own_pos[1] <= oymax):
+                self._start_egress(own_base, enemy=False)
+
+            # Target selection
+            if self._push_mode:
+                # push toward slightly deeper than center; egress logic will peel us out
+                tgt = self._add(base_c, self._mul(self._norm(self._add(*self._base_axes(own_base))), 0.06))
+            else:
+                tgt = ap
+
+            tgt = self._add(tgt, self._nudge(own_pos, bot_coords))
+            return self._drive_to(own_pos, own_dir, tgt)
+
+        # Fallback idle
+        park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+        return self._drive_to(own_pos, own_dir, park)
+
+
+@register_bot
+class SectorRunner:
+    """
+    Deterministic split + straight egress (no wall-scrape).
+
+    Key ideas
+    ---------
+    • Field split: each bot owns a half-plane relative to OUR base center (left/right of the base diagonal).
+      Even indices (0,2) take the "left" sector; odd (1,3) take "right". This prevents both chasing the same ball.
+    • Robust approach: behind-ball point is clamped inside the arena and kept OUT of the enemy base box.
+    • Push-through then OUT: after a delivery (or if we ever end up inside ANY base), we egress straight
+      toward arena center by a sizeable distance — no tangent slide that hits walls.
+    • Red handling: odd-index bot clears reds only when they’re close to our base center; otherwise ignore reds.
+
+    Notes
+    -----
+    • No external helpers; returns [left, right] in [-1,1].
+    • Conservative turning to reduce in-place oscillations.
+    """
+
+    # ---- Arena / base ----
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+    WALL_M = 0.04           # keep approach points at least this far from walls
+
+    # ---- Ball handling ----
+    APPROACH_OFFSET = 0.090  # stand-off behind the ball
+    CAPTURE_R = 0.060        # enter push when closer than this to ball
+    ALIGN_PUSH_DEG = 28.0    # need this alignment to flip to PUSH
+
+    # ---- Controller (gentle) ----
+    TURN_GAIN = 1.45
+    ALIGN_TURN_ONLY = 80.0   # (deg) if worse than this, rotate in place (no forward)
+    MAX_SPEED = 1.0
+
+    # ---- Selection / split ----
+    LOCK_TOL = 0.06          # same-ball tolerance
+    LOCK_MARGIN = 0.22       # switch only if plan clearly better
+    THREAT_R = 0.27          # red threat radius around our base center
+
+    # ---- Egress (both bases) ----
+    EGRESS_DIST = 0.35       # how far to exit toward arena center
+    EGRESS_TICKS = 40        # ~0.17s @ 240Hz
+    BASE_MARGIN_ENEMY = 0.08 # treat enemy base as "forbidden" with this margin
+
+    # ---- Light separation (mate + walls) ----
+    SEP_RADIUS = 0.18
+    SEP_GAIN = 0.08
+
+    # ---- Stuck recovery ----
+    HIST_N = 28
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS = 24
+
+    # ========================= impl =========================
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._m = math
+        self._index = index
+        self._is_sweeper = (index % 2 == 1)
+        self._lock_kind = None   # 'green' or 'red'
+        self._lock_pos = None
+        self._push_mode = False
+        self._egress_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+
+    # ---------- tiny vec utils ----------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a)
+        return (0.0,0.0) if L == 0 else (a[0]/L, a[1]/L)
+    def _perp(self,a): return (-a[1], a[0])
+    def _dot(self,a,b): return a[0]*b[0] + a[1]*b[1]
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp01(self,x,lo,hi): return lo if x < lo else hi if x > hi else x
+
+    # ---------- bases ----------
+    def _own_base(self): return get_base_coords(self._index)
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0), (self.ARENA_W,0.0), (0.0,self.ARENA_H), (self.ARENA_W,self.ARENA_H)]
+        return max(corners, key=lambda c: self._dist(c, (bx,by)))
+
+    def _base_axes(self, corner):
+        # axis-aligned inward unit vectors from a base corner
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        return (ix, 0.0), (0.0, iy)
+
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+
+    def _base_rect(self, corner, margin=0.0):
+        ax, ay = self._base_axes(corner)
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+
+    # ---------- controller ----------
+    def _drive(self, own_pos, own_dir, target):
+        dx, dy = target[0]-own_pos[0], target[1]-own_pos[1]
+        if dx == 0.0 and dy == 0.0:
+            return [0.0, 0.0]
+        t_ang = self._m.atan2(dy, dx)
+        err = (t_ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+        if abs(err) > self._m.radians(self.ALIGN_TURN_ONLY):
+            fwd = 0.0
+        else:
+            fwd = self.MAX_SPEED * max(0.0, self._m.cos(err))
+        turn = self.TURN_GAIN * err
+        l = fwd - turn
+        r = fwd + turn
+        mag = max(1.0, abs(l), abs(r))
+        return [l/mag, r/mag]
+
+    # ---------- approach helpers ----------
+    def _approach_point(self, ball, goal_point):
+        to_goal = self._norm(self._sub(goal_point, ball))
+        if to_goal == (0.0,0.0): to_goal = (1.0,0.0)
+        ap = self._add(ball, self._mul(to_goal, -self.APPROACH_OFFSET))
+        # clamp inside arena with small margin
+        ap = (self._clamp01(ap[0], self.WALL_M, self.ARENA_W - self.WALL_M),
+              self._clamp01(ap[1], self.WALL_M, self.ARENA_H - self.WALL_M))
+        return ap, to_goal
+
+    def _keep_out_enemy_base(self, point, enemy_corner):
+        # if approach point falls into (expanded) enemy base -> push it outward toward arena center
+        xmin, xmax, ymin, ymax = self._base_rect(enemy_corner, margin=self.BASE_MARGIN_ENEMY)
+        if xmin <= point[0] <= xmax and ymin <= point[1] <= ymax:
+            center = self._base_center(enemy_corner)
+            out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+            return self._add(center, self._mul(out, self.EGRESS_DIST*0.6))
+        return point
+
+    # ---------- split logic ----------
+    def _sector_side(self, base_corner, p):
+        # sign of dot relative to tangent of base diagonal (center-directed)
+        center = self._base_center(base_corner)
+        inward = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), base_corner))
+        tangent = self._perp(inward)
+        return self._dot(self._sub(p, center), tangent)  # <0 = "left", >0 = "right"
+
+    def _rank_greens(self, own_pos, greens, base_corner):
+        base_c = self._base_center(base_corner)
+        # cost: distance to approach point + 0.5 * ball->center distance
+        def gcost(g):
+            ap, _ = self._approach_point(g, base_c)
+            return self._dist(own_pos, ap) + 0.5*self._dist(g, base_c)
+        return sorted(greens, key=gcost)
+
+    # ---------- tiny nudges ----------
+    def _nudge(self, own_pos, bot_coords):
+        n = (0.0,0.0)
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = self._dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = self._norm(self._sub(own_pos, mate_pos))
+                n = self._add(n, self._mul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        # slight wall push
+        x, y = own_pos
+        if x < self.WALL_M: n = self._add(n, ( self.SEP_GAIN*(self.WALL_M-x)/self.WALL_M, 0.0))
+        if self.ARENA_W - x < self.WALL_M: n = self._add(n, (-self.SEP_GAIN*(self.WALL_M-(self.ARENA_W-x))/self.WALL_M, 0.0))
+        if y < self.WALL_M: n = self._add(n, (0.0,  self.SEP_GAIN*(self.WALL_M-y)/self.WALL_M))
+        if self.ARENA_H - y < self.WALL_M: n = self._add(n, (0.0, -self.SEP_GAIN*(self.WALL_M-(self.ARENA_H-y))/self.WALL_M))
+        return n
+
+    # ---------- stuck & egress ----------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0; prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp01(-0.55 - 0.30*s, -1, 1), self._clamp01(-0.55 + 0.30*s, -1, 1)]
+
+    def _start_egress_from(self, base_corner):
+        self._egress_ticks = self.EGRESS_TICKS
+        self._egress_from = base_corner  # could be own or enemy base
+
+    def _egress_target(self, base_corner):
+        center = self._base_center(base_corner)
+        out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+        # big step toward arena center
+        tgt = self._add(center, self._mul(out, self.EGRESS_DIST))
+        return (self._clamp01(tgt[0], self.WALL_M, self.ARENA_W-self.WALL_M),
+                self._clamp01(tgt[1], self.WALL_M, self.ARENA_H-self.WALL_M))
+
+    # ---------- idling ----------
+    def getWaitPosition(self):
+        return (0.48, 1.08) if self._index < 2 else (1.08, 0.48)
+
+    # ============================ MAIN ============================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        own_center = self._base_center(own_base)
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # If we are inside ANY base (own or enemy), egress straight toward arena center
+        for base_corner, margin in [(own_base, 0.0), (enemy_base, self.BASE_MARGIN_ENEMY)]:
+            xmin, xmax, ymin, ymax = self._base_rect(base_corner, margin=margin)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                if self._egress_ticks == 0:
+                    self._start_egress_from(base_corner)
+                break
+
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            tgt = self._add(self._egress_target(self._egress_from), self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, tgt)
+
+        # Sweeper clears threatening REDs near OUR base center
+        if self._is_sweeper and red_coords:
+            threats = [r for r in red_coords if self._dist(r, own_center) <= self.THREAT_R]
+            if threats:
+                # push away from our base, toward arena center
+                arena_center = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+                red = min(threats, key=lambda r: self._dist(r, own_center))
+                ap, _ = self._approach_point(red, arena_center)
+                ap = self._add(ap, self._nudge(own_pos, bot_coords))
+                return self._drive(own_pos, own_dir, ap)
+
+        # ====== GREEN selection with sector split ======
+        # Preferred side sign for this bot
+        preferred_right = (self._index % 2 == 1)  # odd -> right, even -> left
+        # Partition greens by side
+        side_vals = [(g, self._sector_side(own_base, g)) for g in green_coords]
+        if preferred_right:
+            preferred = [g for g,s in side_vals if s >= 0.0]
+            other     = [g for g,s in side_vals if s < 0.0]
+        else:
+            preferred = [g for g,s in side_vals if s < 0.0]
+            other     = [g for g,s in side_vals if s >= 0.0]
+
+        ranked_pref = self._rank_greens(own_pos, preferred, own_base)
+        ranked_other = self._rank_greens(own_pos, other, own_base)
+        choice = ranked_pref[0] if ranked_pref else (ranked_other[0] if ranked_other else None)
+
+        # Acquire/keep lock
+        if self._lock_kind != 'green' or self._lock_pos is None:
+            if choice is not None:
+                self._lock_kind, self._lock_pos, self._push_mode = 'green', choice, False
+        else:
+            # If same ball still exists near previous lock, refresh; else consider switch if clearly better
+            same = None
+            for g in green_coords:
+                if self._dist(g, self._lock_pos) <= self.LOCK_TOL:
+                    same = g; break
+            if same is not None:
+                self._lock_pos = same
+            elif choice is not None:
+                # Switch only if much better
+                cur_ap, _ = self._approach_point(self._lock_pos, own_center)
+                new_ap, _ = self._approach_point(choice, own_center)
+                cur_cost = self._dist(own_pos, cur_ap) + 0.5*self._dist(self._lock_pos, own_center)
+                new_cost = self._dist(own_pos, new_ap) + 0.5*self._dist(choice, own_center)
+                if new_cost + self.LOCK_MARGIN < cur_cost:
+                    self._lock_pos, self._push_mode = choice, False
+            else:
+                # No greens: idle mid-field
+                park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+                return self._drive(own_pos, own_dir, park)
+
+        # ====== Execute approach / push ======
+        if self._lock_kind == 'green' and self._lock_pos is not None:
+            ap, to_goal = self._approach_point(self._lock_pos, own_center)
+            ap = self._keep_out_enemy_base(ap, enemy_base)  # never aim into enemy base area
+
+            # Enter push mode when close & aligned with ball->goal
+            if not self._push_mode:
+                desired = self._m.atan2(to_goal[1], to_goal[0])
+                err = (desired - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+                if self._dist(own_pos, self._lock_pos) <= self.CAPTURE_R and abs(err) <= self._m.radians(self.ALIGN_PUSH_DEG):
+                    self._push_mode = True
+
+            # If in our base while pushing, immediately schedule a straight egress after a tick
+            xmin, xmax, ymin, ymax = self._base_rect(own_base, margin=0.0)
+            if self._push_mode and (xmin <= own_pos[0] <= xmax) and (ymin <= own_pos[1] <= ymax):
+                if self._egress_ticks == 0:
+                    self._start_egress_from(own_base)
+
+            # Choose target
+            target = own_center if self._push_mode else ap
+            target = self._add(target, self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, target)
+
+        # Fallback idle
+        park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+        return self._drive(own_pos, own_dir, park)
+
+@register_bot
+class ContestBreaker:
+    """
+    Breaks mid-field oscillations via:
+      • Deterministic side split (each bot owns a side relative to its base diagonal).
+      • Contest resolution: if an opponent is also on the same ball from the opposite side,
+        approach on a *deflect* line (sideways bump toward our base) instead of head-on.
+      • Post-score hard egress straight toward arena center (no wall-scrape).
+      • Gentle, low-gain controller to reduce in-place wiggle; approach points clamped off walls.
+
+    No external helpers; returns [left,right] in [-1,1].
+    """
+
+    # ---- Arena / base ----
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+    WALL_M = 0.05             # min margin from walls for approach points
+    ENEMY_KEEP_OUT = 0.10     # avoid targeting points inside enemy base (+margin)
+
+    # ---- Handling ----
+    APPROACH_OFFSET = 0.090   # stand-off behind the ball
+    CAPTURE_R = 0.060         # enter push when within this to ball
+    ALIGN_PUSH_DEG = 28.0     # require this alignment to start PUSH
+    ALIGN_TURN_ONLY = 82.0    # if worse than this, rotate in place
+
+    # ---- Controller (gentle) ----
+    TURN_GAIN = 1.45
+    MAX_SPEED = 1.0
+
+    # ---- Selection / split ----
+    LOCK_TOL = 0.06           # same-ball tolerance
+    LOCK_MARGIN = 0.22        # only switch lock if clearly better
+    THREAT_R = 0.27           # red threat radius around our base center
+    SIDE_BIAS = 0.08          # deterministic lateral bias to break symmetry (m)
+
+    # ---- Contest resolution (anti head-on) ----
+    CONTEST_R = 0.22          # opponent considered "contesting" a ball if within this
+    OPPOSED_DOT = -0.35       # if our approach dir · theirs < this -> opposed
+    DEFLECT_ANGLE_DEG = 28.0  # rotate approach by this (sideways bump)
+    DEFLECT_TICKS = 55        # time to commit to a deflect push
+
+    # ---- Egress ----
+    EGRESS_DIST = 0.38        # step toward arena center when in a base
+    EGRESS_TICKS = 42
+
+    # ---- Separation / walls ----
+    SEP_RADIUS = 0.18
+    SEP_GAIN = 0.08
+
+    # ---- Stuck recovery ----
+    HIST_N = 30
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS = 24
+
+    # ========================= impl =========================
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._m = math
+        self._index = index
+        self._is_sweeper = (index % 2 == 1)   # odd clears threatening reds
+        self._lock_kind = None                # 'green' or 'red'
+        self._lock_pos = None
+        self._push_mode = False
+        self._egress_ticks = 0
+        self._deflect_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+
+    # ---------- tiny vec utils ----------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a)
+        return (0.0,0.0) if L == 0 else (a[0]/L, a[1]/L)
+    def _perp(self,a): return (-a[1], a[0])
+    def _dot(self,a,b): return a[0]*b[0] + a[1]*b[1]
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp(self,x,lo,hi): return lo if x < lo else hi if x > hi else x
+    def _clamp_pt(self,p):
+        return (self._clamp(p[0], self.WALL_M, self.ARENA_W - self.WALL_M),
+                self._clamp(p[1], self.WALL_M, self.ARENA_H - self.WALL_M))
+
+    # ---------- bases ----------
+    def _own_base(self): return get_base_coords(self._index)
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0),(self.ARENA_W,0.0),(0.0,self.ARENA_H),(self.ARENA_W,self.ARENA_H)]
+        return max(corners, key=lambda c: self._dist(c,(bx,by)))
+
+    def _base_axes(self, corner):
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        return (ix,0.0),(0.0,iy)
+
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+
+    def _base_rect(self, corner, margin=0.0):
+        ax, ay = self._base_axes(corner)
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+
+    # ---------- controller ----------
+    def _drive(self, own_pos, own_dir, target):
+        dx, dy = target[0]-own_pos[0], target[1]-own_pos[1]
+        if dx == 0.0 and dy == 0.0: return [0.0, 0.0]
+        t_ang = self._m.atan2(dy, dx)
+        err = (t_ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+        if abs(err) > self._m.radians(self.ALIGN_TURN_ONLY):
+            fwd = 0.0
+        else:
+            fwd = self.MAX_SPEED * max(0.0, self._m.cos(err))
+        turn = self.TURN_GAIN * err
+        l = fwd - turn; r = fwd + turn
+        mag = max(1.0, abs(l), abs(r))
+        return [l/mag, r/mag]
+
+    # ---------- approach helpers ----------
+    def _approach_point(self, ball, goal_point, lateral=0.0):
+        to_goal = self._norm(self._sub(goal_point, ball))
+        if to_goal == (0.0,0.0): to_goal = (1.0,0.0)
+        ap = self._add(ball, self._mul(to_goal, -self.APPROACH_OFFSET))
+        if lateral != 0.0:
+            side = self._perp(to_goal)
+            ap = self._add(ap, self._mul(side, lateral))
+        return self._clamp_pt(ap), to_goal
+
+    def _keep_out_enemy_base(self, p, enemy_corner):
+        xmin, xmax, ymin, ymax = self._base_rect(enemy_corner, margin=self.ENEMY_KEEP_OUT)
+        if xmin <= p[0] <= xmax and ymin <= p[1] <= ymax:
+            center = self._base_center(enemy_corner)
+            out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+            p = self._add(center, self._mul(out, self.EGRESS_DIST*0.6))
+        return self._clamp_pt(p)
+
+    # ---------- sector split ----------
+    def _sector_side(self, base_corner, p):
+        center = self._base_center(base_corner)
+        inward = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), base_corner))
+        tangent = self._perp(inward)
+        return self._dot(self._sub(p, center), tangent)  # <0 left, >0 right
+
+    # ---------- opponent awareness ----------
+    def _opponents(self):
+        # Opponents are indices from the other team: if [0,1] -> [2,3], else [0,1]
+        return [2,3] if self._index < 2 else [0,1]
+
+    def _contest_info(self, ball, bot_coords, goal_point):
+        """Return (is_contested, opposed_dir_sign)"""
+        # Our intended approach dir
+        ours = self._norm(self._sub(goal_point, ball))
+        # check nearest opponent near the ball
+        opps = self._opponents()
+        for i in opps:
+            pos, heading = bot_coords[i]
+            if self._dist(pos, ball) <= self.CONTEST_R:
+                theirs = self._norm(self._sub(goal_point, pos))  # crude: where *they* might go
+                if self._dot(ours, theirs) < self.OPPOSED_DOT:
+                    # opposed approaches; return side sign using absolute geometry to break symmetry
+                    # sign: choose deflect side based on whether our base is "south/east" vs "north/west"
+                    bx, by = self._own_base()
+                    sign = 1.0 if (bx + by) < (self.ARENA_W + self.ARENA_H)/2 else -1.0
+                    return True, sign
+        return False, 0.0
+
+    # ---------- nudges ----------
+    def _nudge(self, own_pos, bot_coords):
+        n = (0.0,0.0)
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = self._dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = self._norm(self._sub(own_pos, mate_pos))
+                n = self._add(n, self._mul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        # wall soft push
+        x, y = own_pos
+        if x < self.WALL_M: n = self._add(n, ( self.SEP_GAIN*(self.WALL_M-x)/self.WALL_M, 0.0))
+        if self.ARENA_W - x < self.WALL_M: n = self._add(n, (-self.SEP_GAIN*(self.WALL_M-(self.ARENA_W-x))/self.WALL_M, 0.0))
+        if y < self.WALL_M: n = self._add(n, (0.0,  self.SEP_GAIN*(self.WALL_M-y)/self.WALL_M))
+        if self.ARENA_H - y < self.WALL_M: n = self._add(n, (0.0, -self.SEP_GAIN*(self.WALL_M-(self.ARENA_H-y))/self.WALL_M))
+        return n
+
+    # ---------- stuck & egress ----------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0; prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp(-0.55 - 0.30*s, -1, 1), self._clamp(-0.55 + 0.30*s, -1, 1)]
+
+    def _start_egress_from(self, corner):
+        self._egress_ticks = self.EGRESS_TICKS
+        self._egress_from = corner
+
+    def _egress_target(self, corner):
+        center = self._base_center(corner)
+        out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+        tgt = self._add(center, self._mul(out, self.EGRESS_DIST))
+        return self._clamp_pt(tgt)
+
+    # ---------- idling ----------
+    def getWaitPosition(self):
+        return (0.48, 1.08) if self._index < 2 else (1.08, 0.48)
+
+    # ============================ MAIN ============================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        own_center = self._base_center(own_base)
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # If inside any base -> egress straight to arena center
+        for corner, margin in [(own_base, 0.0), (enemy_base, self.ENEMY_KEEP_OUT)]:
+            xmin, xmax, ymin, ymax = self._base_rect(corner, margin)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                if self._egress_ticks == 0:
+                    self._start_egress_from(corner)
+                break
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            tgt = self._add(self._egress_target(self._egress_from), self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, tgt)
+
+        # Sweeper clears threatening reds near *our* base center
+        if self._is_sweeper and red_coords:
+            threats = [r for r in red_coords if self._dist(r, own_center) <= self.THREAT_R]
+            if threats:
+                arena_center = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+                red = min(threats, key=lambda r: self._dist(r, own_center))
+                ap, _ = self._approach_point(red, arena_center)
+                ap = self._add(ap, self._nudge(own_pos, bot_coords))
+                return self._drive(own_pos, own_dir, ap)
+
+        # ====== GREEN selection with deterministic side split ======
+        # Side preference based on base diagonal; add tiny bias to break mirror symmetry for both teams.
+        side_bias_sign = 1.0 if (own_base[0] + own_base[1]) < (self.ARENA_W + self.ARENA_H)/2 else -1.0
+        preferred_right = (self._index % 2 == 1)
+        def sideval(p):
+            s = self._sector_side(own_base, p)
+            # bias pulls each bot a little to one side of the diagonal in absolute arena coords
+            return s + side_bias_sign * (self.SIDE_BIAS if preferred_right else -self.SIDE_BIAS)
+
+        side_vals = [(g, sideval(g)) for g in green_coords]
+        if preferred_right:
+            preferred = [g for g,s in side_vals if s >= 0.0]
+            other     = [g for g,s in side_vals if s < 0.0]
+        else:
+            preferred = [g for g,s in side_vals if s < 0.0]
+            other     = [g for g,s in side_vals if s >= 0.0]
+
+        def rank_gs(gs):
+            def cost(g):
+                ap, _ = self._approach_point(g, own_center)
+                return self._dist(own_pos, ap) + 0.5*self._dist(g, own_center)
+            return sorted(gs, key=cost)
+
+        ranked = rank_gs(preferred) or rank_gs(other)
+        choice = ranked[0] if ranked else None
+
+        # Acquire/keep lock
+        if self._lock_kind != 'green' or self._lock_pos is None:
+            if choice is not None:
+                self._lock_kind, self._lock_pos, self._push_mode = 'green', choice, False
+        else:
+            same = None
+            for g in green_coords:
+                if self._dist(g, self._lock_pos) <= self.LOCK_TOL:
+                    same = g; break
+            if same is not None:
+                self._lock_pos = same
+            elif choice is not None:
+                cur_ap, _ = self._approach_point(self._lock_pos, own_center)
+                new_ap, _ = self._approach_point(choice, own_center)
+                cur_cost = self._dist(own_pos, cur_ap) + 0.5*self._dist(self._lock_pos, own_center)
+                new_cost = self._dist(own_pos, new_ap) + 0.5*self._dist(choice, own_center)
+                if new_cost + self.LOCK_MARGIN < cur_cost:
+                    self._lock_pos, self._push_mode = choice, False
+            else:
+                park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+                return self._drive(own_pos, own_dir, park)
+
+        # ====== Execute approach / push with contest resolution ======
+        if self._lock_kind == 'green' and self._lock_pos is not None:
+            # default approach
+            lateral = 0.0
+            # If an opponent is also on this ball from the *opposite* side, enter deflect mode
+            contested, side_sign = self._contest_info(self._lock_pos, bot_coords, own_center)
+            if contested and self._deflect_ticks == 0:
+                self._deflect_ticks = self.DEFLECT_TICKS
+            if self._deflect_ticks > 0:
+                self._deflect_ticks -= 1
+                # rotate approach by DEFLECT_ANGLE toward side_sign to bump sideways toward our base
+                lateral = side_sign * self.SIDE_BIAS
+
+            ap, to_goal = self._approach_point(self._lock_pos, own_center, lateral=lateral)
+            ap = self._keep_out_enemy_base(ap, enemy_base)
+
+            # push mode gate: close + aligned
+            if not self._push_mode:
+                desired = self._m.atan2(to_goal[1], to_goal[0])
+                err = (desired - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+                if self._dist(own_pos, self._lock_pos) <= self.CAPTURE_R and abs(err) <= self._m.radians(self.ALIGN_PUSH_DEG):
+                    self._push_mode = True
+
+            # if inside our base while pushing -> schedule egress
+            xmin, xmax, ymin, ymax = self._base_rect(own_base, 0.0)
+            if self._push_mode and (xmin <= own_pos[0] <= xmax) and (ymin <= own_pos[1] <= ymax):
+                if self._egress_ticks == 0:
+                    self._start_egress_from(own_base)
+
+            target = own_center if self._push_mode else ap
+            target = self._add(target, self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, target)
+
+        # Fallback idle
+        park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+        return self._drive(own_pos, own_dir, park)
+
+
+
+@register_bot
+class RouteWeaver:
+    """
+    Route-style harvester (no opponent modeling).
+
+    Core idea
+    ---------
+    Instead of re-choosing every tick, each bot builds a tiny *route* (1–2 balls max) through
+    its half of the field and executes it end-to-end:
+      1) pick a sector (left/right of our base diagonal) → prevents teammate dogpiles,
+      2) plan a short sequence: [behind(ball1) -> base] and optionally [behind(ball2) -> base],
+      3) commit (hard lock) until the step is clearly invalidated, then replan.
+
+    This kills mid-field oscillations by removing constant re-targeting, while remaining
+    opponent-agnostic and fast enough for 30 s games.
+
+    Extras:
+      • Behind-the-ball approach + push-through to base center.
+      • Hard egress if we find ourselves inside any base.
+      • Tiny low-pass on wheel speeds to suppress wiggle.
+    """
+
+    # --- arena / base ---
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+
+    # --- approach / push ---
+    APPROACH_OFFSET = 0.09     # stand-off behind ball
+    CAPTURE_R       = 0.06     # start pushing when this close to ball
+    ALIGN_PUSH_DEG  = 28.0     # need this alignment to enter push
+    ENEMY_KEEP_OUT  = 0.10     # don't place approach points inside enemy base (+margin)
+
+    # --- controller ---
+    TURN_GAIN       = 1.45
+    ALIGN_TURN_ONLY = 80.0     # deg: rotate-in-place if worse than this
+    MAX_SPEED       = 1.0
+    LPF_ALPHA       = 0.75     # low-pass on wheel commands (higher = smoother)
+
+    # --- routing ---
+    LOCK_TOL     = 0.06        # ball considered same if within this
+    REPLAN_MARGIN = 0.22       # replan only if a new option beats current by this many meters
+    MAX_STOPS      = 2         # plan up to 2 balls per route (keeps horizon short)
+    SIDE_BIAS      = 0.06      # lateral bias to break mirror symmetry when choosing sector boundary
+
+    # --- egress / separation / walls ---
+    EGRESS_DIST   = 0.38
+    EGRESS_TICKS  = 40
+    SEP_RADIUS    = 0.18
+    SEP_GAIN      = 0.08
+    WALL_M        = 0.05
+
+    # --- stuck recovery ---
+    HIST_N         = 30
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS   = 24
+
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._m = math
+        self._index = index
+        self._route = []          # list of ("approach", point) or ("push", base_center)
+        self._push_mode = False
+        self._egress_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+        self._u_prev = [0.0, 0.0] # for low-pass filter
+
+    # ---------- tiny vec utils ----------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a)
+        return (0.0,0.0) if L==0 else (a[0]/L, a[1]/L)
+    def _perp(self,a): return (-a[1], a[0])
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp(self,x,lo,hi): return lo if x<lo else hi if x>hi else x
+    def _clamp_pt(self,p):
+        return (self._clamp(p[0], self.WALL_M, self.ARENA_W - self.WALL_M),
+                self._clamp(p[1], self.WALL_M, self.ARENA_H - self.WALL_M))
+
+    # ---------- bases ----------
+    def _own_base(self): return get_base_coords(self._index)
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0),(self.ARENA_W,0.0),(0.0,self.ARENA_H),(self.ARENA_W,self.ARENA_H)]
+        return max(corners, key=lambda c: self._dist(c,(bx,by)))
+    def _base_axes(self, corner):
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        return (ix,0.0),(0.0,iy)
+    def _base_rect(self, corner, margin=0.0):
+        ax, ay = self._base_axes(corner)
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+
+    # ---------- controller ----------
+    def _drive(self, own_pos, own_dir, target):
+        dx, dy = target[0]-own_pos[0], target[1]-own_pos[1]
+        if dx == 0.0 and dy == 0.0:
+            cmd = [0.0, 0.0]
+        else:
+            t_ang = self._m.atan2(dy, dx)
+            err = (t_ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+            if abs(err) > self._m.radians(self.ALIGN_TURN_ONLY):
+                fwd = 0.0
+            else:
+                fwd = self.MAX_SPEED * max(0.0, self._m.cos(err))
+            turn = self.TURN_GAIN * err
+            l = fwd - turn; r = fwd + turn
+            mag = max(1.0, abs(l), abs(r))
+            cmd = [l/mag, r/mag]
+        # low-pass filter wheel commands (reduces wiggle)
+        alpha = self.LPF_ALPHA
+        out = [alpha*self._u_prev[0] + (1-alpha)*cmd[0],
+               alpha*self._u_prev[1] + (1-alpha)*cmd[1]]
+        self._u_prev = out
+        return out
+
+    # ---------- approach helpers ----------
+    def _approach_point(self, ball, goal_point, lateral=0.0):
+        to_goal = self._norm(self._sub(goal_point, ball))
+        if to_goal == (0.0,0.0): to_goal = (1.0,0.0)
+        ap = self._add(ball, self._mul(to_goal, -self.APPROACH_OFFSET))
+        if lateral != 0.0:
+            ap = self._add(ap, self._mul(self._perp(to_goal), lateral))
+        return self._clamp_pt(ap), to_goal
+
+    def _keep_out_enemy_base(self, p, enemy_corner):
+        xmin, xmax, ymin, ymax = self._base_rect(enemy_corner, margin=self.ENEMY_KEEP_OUT)
+        if xmin <= p[0] <= xmax and ymin <= p[1] <= ymax:
+            center = self._base_center(enemy_corner)
+            outward = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+            p = self._add(center, self._mul(outward, self.EGRESS_DIST*0.6))
+        return self._clamp_pt(p)
+
+    # ---------- sectoring ----------
+    def _sector_side(self, base_corner, p):
+        center = self._base_center(base_corner)
+        inward = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), base_corner))
+        tangent = self._perp(inward)
+        return self._m.copysign(1.0, (p[0]-center[0])*tangent[0] + (p[1]-center[1])*tangent[1])
+
+    # ---------- tiny nudges ----------
+    def _nudge(self, own_pos, bot_coords):
+        n = (0.0,0.0)
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = self._dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = self._norm(self._sub(own_pos, mate_pos))
+                n = self._add(n, self._mul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        x,y = own_pos
+        if x < self.WALL_M: n = self._add(n, ( self.SEP_GAIN*(self.WALL_M-x)/self.WALL_M, 0.0))
+        if self.ARENA_W - x < self.WALL_M: n = self._add(n, (-self.SEP_GAIN*(self.WALL_M-(self.ARENA_W-x))/self.WALL_M, 0.0))
+        if y < self.WALL_M: n = self._add(n, (0.0,  self.SEP_GAIN*(self.WALL_M-y)/self.WALL_M))
+        if self.ARENA_H - y < self.WALL_M: n = self._add(n, (0.0, -self.SEP_GAIN*(self.WALL_M-(self.ARENA_H-y))/self.WALL_M))
+        return n
+
+    # ---------- stuck & egress ----------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0; prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp(-0.55 - 0.30*s, -1, 1), self._clamp(-0.55 + 0.30*s, -1, 1)]
+    def _start_egress_from(self, corner):
+        self._egress_ticks = self.EGRESS_TICKS
+        self._egress_from = corner
+    def _egress_target(self, corner):
+        center = self._base_center(corner)
+        out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+        tgt = self._add(center, self._mul(out, self.EGRESS_DIST))
+        return self._clamp_pt(tgt)
+
+    # ---------- idling ----------
+    def getWaitPosition(self):
+        return (0.48, 1.08) if self._index < 2 else (1.08, 0.48)
+
+    # ---------- route planning ----------
+    def _rank_greens(self, from_pos, greens, base_corner):
+        center = self._base_center(base_corner)
+        def cost(g):
+            ap, _ = self._approach_point(g, center)
+            return self._dist(from_pos, ap) + 0.5*self._dist(g, center)
+        return sorted(greens, key=cost)
+
+    def _build_route(self, own_pos, greens):
+        """Return a route: sequence of ('approach', pt) and ('push', base_center)."""
+        route = []
+        own_base = self._own_base()
+        center = self._base_center(own_base)
+        enemy_base = self._enemy_base()
+
+        # sector split with slight bias to break symmetry
+        preferred_right = (self._index % 2 == 1)
+        bias = self.SIDE_BIAS if preferred_right else -self.SIDE_BIAS
+        preferred = []
+        for g in greens:
+            side = self._sector_side(own_base, g)
+            # pull each bot slightly off the exact diagonal boundary
+            if preferred_right:
+                if side > 0.0 or abs(side) < 1.0 and g[0] > center[0] + bias:
+                    preferred.append(g)
+            else:
+                if side < 0.0 or abs(side) < 1.0 and g[0] < center[0] + bias:
+                    preferred.append(g)
+        pool = preferred if preferred else greens[:]
+
+        pos = own_pos
+        picked = []
+        for _ in range(self.MAX_STOPS):
+            ranked = self._rank_greens(pos, pool, own_base)
+            if not ranked: break
+            g = ranked[0]
+            ap, _ = self._approach_point(g, center)
+            ap = self._keep_out_enemy_base(ap, enemy_base)
+            route.append(("approach", ap))
+            route.append(("push", center))
+            picked.append(g)
+            # simulate after scoring: we end near center
+            pos = center
+            # remove picked
+            pool = [x for x in pool if self._dist(x, g) > self.LOCK_TOL]
+        return route
+
+    # ============================ MAIN ============================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        center = self._base_center(own_base)
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # EGRESS if in any base
+        for corner, margin in [(own_base, 0.0), (enemy_base, self.ENEMY_KEEP_OUT)]:
+            xmin, xmax, ymin, ymax = self._base_rect(corner, margin)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                if self._egress_ticks == 0:
+                    self._start_egress_from(corner)
+                break
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            tgt = self._add(self._egress_target(self._egress_from), self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, tgt)
+
+        # (Re)plan route if empty or clearly improvable
+        need_plan = (not self._route)
+        if not need_plan:
+            # validate current step against current balls
+            step_kind, step_pt = self._route[0]
+            if step_kind == "approach":
+                # find any ball near the implied ball line (within LOCK_TOL of step's forward point)
+                # if none exists anymore, replan
+                # heuristic: compute ball that would map to this approach (inverse not exact, but close)
+                # Simply check that at least one green remains; otherwise route is moot.
+                need_plan = (len(green_coords) == 0)
+
+        if need_plan:
+            self._route = self._build_route(own_pos, list(green_coords))  # copy in case caller mutates
+            self._push_mode = False
+
+        # If still no route (no greens), idle mid-field
+        if not self._route:
+            park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, park)
+
+        # Execute route
+        step_kind, step_pt = self._route[0]
+
+        if step_kind == "approach":
+            # If a closer *new* approach exists that beats current by margin, rebuild route
+            ranked_now = self._rank_greens(own_pos, list(green_coords), own_base)
+            if ranked_now:
+                ap_best, _ = self._approach_point(ranked_now[0], center)
+                cur_cost = self._dist(own_pos, step_pt)
+                new_cost = self._dist(own_pos, ap_best)
+                if new_cost + self.REPLAN_MARGIN < cur_cost:
+                    self._route = self._build_route(own_pos, list(green_coords))
+                    step_kind, step_pt = self._route[0]
+            # Drive to approach
+            tgt = self._add(step_pt, self._nudge(own_pos, bot_coords))
+            cmd = self._drive(own_pos, own_dir, tgt)
+
+            # enter push when close to *some* ball along base direction
+            near = None
+            for g in green_coords:
+                if self._dist(g, own_pos) <= self.CAPTURE_R*1.2:
+                    near = g; break
+            if near is not None:
+                # step complete -> switch to push phase immediately
+                self._route.pop(0)
+                self._push_mode = True
+            return cmd
+
+        # PUSH step: target = base center; leave as soon as we enter base (egress will kick in)
+        if step_kind == "push":
+            tgt = self._add(center, self._nudge(own_pos, bot_coords))
+            cmd = self._drive(own_pos, own_dir, tgt)
+            # If inside our base, consume this step and trigger egress next loop
+            xmin, xmax, ymin, ymax = self._base_rect(own_base, 0.0)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                self._route.pop(0)
+                if self._egress_ticks == 0:
+                    self._start_egress_from(own_base)
+            return cmd
+
+
+@register_bot
+class PolarHarvester:
+    """
+    Polar, base-centric harvester (opponent-agnostic).
+
+    Big idea:
+      • Each bot works a permanent ANGULAR SECTOR around its own base center
+        (even index = "left" sector, odd index = "right" sector), measured about the base center.
+      • Always take the GREEN with the smallest *radial distance* to our base center
+        inside its sector (closest-to-score first). This prevents mid-field duels and
+        gives short, straight pushes.
+      • Opening split: each bot sprints to a distinct tangent STAGING point along the
+        base mouth for ~0.5 s, so they never point at the same first ball.
+      • Push-through, then straight egress toward arena center (no wall scrape).
+      • Low-pass on wheel commands + turn-in-place gating (kills oscillation).
+
+    No opponent modeling. No global replanning chatter.
+    """
+
+    # --- Arena / base ---
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+    WALL_M = 0.05
+
+    # --- Approach / push ---
+    APPROACH_OFFSET = 0.09      # behind-ball standoff (m)
+    CAPTURE_R = 0.060           # start PUSH when this close to ball (m)
+    ALIGN_PUSH_DEG = 28.0       # need this alignment to enter PUSH
+    ENEMY_KEEP_OUT = 0.10       # keep approach points out of enemy base (+margin)
+
+    # --- Controller ---
+    TURN_GAIN = 1.50
+    ALIGN_TURN_ONLY = 82.0      # deg; rotate-in-place if worse than this
+    MAX_SPEED = 1.0
+    LPF_ALPHA = 0.75            # low-pass on wheel commands
+
+    # --- Sectoring & selection ---
+    SECTOR_BIAS = 0.06          # lateral bias to break mirror symmetry (m)
+    LOCK_TOL = 0.06             # ball considered same if within this (m)
+    REPLACE_MARGIN = 0.22       # switch lock only if closer by this many meters
+
+    # --- Opening split & egress ---
+    OPENING_TICKS = 120         # ~0.5 s at 240 Hz (60 fps * T_SCALE=4)
+    EGRESS_DIST = 0.38
+    EGRESS_TICKS = 42
+
+    # --- Separation (mate + walls) ---
+    SEP_RADIUS = 0.18
+    SEP_GAIN = 0.08
+
+    # --- Stuck recovery ---
+    HIST_N = 30
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS = 24
+
+    # ================= impl =================
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._m = math
+        self._index = index
+        self._tick = 0
+        self._lock = None        # current locked GREEN pos
+        self._push_mode = False
+        self._egress_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+        self._u_prev = [0.0, 0.0]  # for low-pass
+
+    # -------- tiny vec utils --------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a)
+        return (0.0,0.0) if L==0 else (a[0]/L, a[1]/L)
+    def _perp(self,a): return (-a[1], a[0])
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp(self,x,lo,hi): return lo if x<lo else hi if x>hi else x
+    def _clamp_pt(self,p):
+        return (self._clamp(p[0], self.WALL_M, self.ARENA_W - self.WALL_M),
+                self._clamp(p[1], self.WALL_M, self.ARENA_H - self.WALL_M))
+
+    # -------- base helpers --------
+    def _own_base(self): return get_base_coords(self._index)
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0),(self.ARENA_W,0.0),(0.0,self.ARENA_H),(self.ARENA_W,self.ARENA_H)]
+        return max(corners, key=lambda c: self._dist(c,(bx,by)))
+    def _base_axes(self, corner):
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        return (ix,0.0),(0.0,iy)
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+    def _base_rect(self, corner, margin=0.0):
+        ax, ay = self._base_axes(corner)
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+
+    # -------- controller (with LPF) --------
+    def _drive(self, own_pos, own_dir, target):
+        dx, dy = target[0]-own_pos[0], target[1]-own_pos[1]
+        if dx == 0.0 and dy == 0.0:
+            cmd = [0.0, 0.0]
+        else:
+            t_ang = self._m.atan2(dy, dx)
+            err = (t_ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+            if abs(err) > self._m.radians(self.ALIGN_TURN_ONLY):
+                fwd = 0.0
+            else:
+                fwd = self.MAX_SPEED * max(0.0, self._m.cos(err))
+            turn = self.TURN_GAIN * err
+            l = fwd - turn; r = fwd + turn
+            mag = max(1.0, abs(l), abs(r))
+            cmd = [l/mag, r/mag]
+        # low-pass
+        a = self.LPF_ALPHA
+        out = [a*self._u_prev[0] + (1-a)*cmd[0],
+               a*self._u_prev[1] + (1-a)*cmd[1]]
+        self._u_prev = out
+        return out
+
+    # -------- approach helpers --------
+    def _approach_point(self, ball, goal_point):
+        to_goal = self._norm(self._sub(goal_point, ball))
+        if to_goal == (0.0,0.0): to_goal = (1.0,0.0)
+        ap = self._add(ball, self._mul(to_goal, -self.APPROACH_OFFSET))
+        return self._clamp_pt(ap), to_goal
+
+    def _keep_out_enemy_base(self, p, enemy_corner):
+        xmin, xmax, ymin, ymax = self._base_rect(enemy_corner, margin=self.ENEMY_KEEP_OUT)
+        if xmin <= p[0] <= xmax and ymin <= p[1] <= ymax:
+            center = self._base_center(enemy_corner)
+            out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+            p = self._add(center, self._mul(out, self.EGRESS_DIST*0.6))
+        return self._clamp_pt(p)
+
+    # -------- sectoring --------
+    def _sector_side(self, base_corner, p):
+        center = self._base_center(base_corner)
+        inward = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), base_corner))
+        tangent = self._perp(inward)
+        # sign of projection onto tangent through base center
+        return (p[0]-center[0])*tangent[0] + (p[1]-center[1])*tangent[1]
+
+    def _in_sector(self, base_corner, p, prefer_right):
+        # Bias to keep bots off the exact diagonal (break perfect symmetry)
+        center = self._base_center(base_corner)
+        side = self._sector_side(base_corner, p)
+        bias = self.SECTOR_BIAS if prefer_right else -self.SECTOR_BIAS
+        # Decide by comparing p.x to center.x shifted by a tiny bias along world X;
+        # this is crude but consistent across both teams.
+        if prefer_right:
+            return side >= 0.0 or p[0] > center[0] + bias
+        else:
+            return side <= 0.0 or p[0] < center[0] + bias
+
+    # -------- tiny nudges --------
+    def _nudge(self, own_pos, bot_coords):
+        n = (0.0,0.0)
+        # teammate only
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = self._dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = self._norm(self._sub(own_pos, mate_pos))
+                n = self._add(n, self._mul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        # walls
+        x,y = own_pos
+        if x < self.WALL_M: n = self._add(n, ( self.SEP_GAIN*(self.WALL_M-x)/self.WALL_M, 0.0))
+        if self.ARENA_W - x < self.WALL_M: n = self._add(n, (-self.SEP_GAIN*(self.WALL_M-(self.ARENA_W-x))/self.WALL_M, 0.0))
+        if y < self.WALL_M: n = self._add(n, (0.0,  self.SEP_GAIN*(self.WALL_M-y)/self.WALL_M))
+        if self.ARENA_H - y < self.WALL_M: n = self._add(n, (0.0, -self.SEP_GAIN*(self.WALL_M-(self.ARENA_H-y))/self.WALL_M))
+        return n
+
+    # -------- stuck & egress --------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0; prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp(-0.55 - 0.30*s, -1, 1), self._clamp(-0.55 + 0.30*s, -1, 1)]
+    def _start_egress_from(self, corner):
+        self._egress_ticks = self.EGRESS_TICKS
+        self._egress_from = corner
+    def _egress_target(self, corner):
+        center = self._base_center(corner)
+        out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+        return self._clamp_pt(self._add(center, self._mul(out, self.EGRESS_DIST)))
+
+    # -------- idling --------
+    def getWaitPosition(self):
+        return (0.48, 1.08) if self._index < 2 else (1.08, 0.48)
+
+    # -------- selection --------
+    def _pick_green_in_sector(self, own_pos, greens, base_corner, prefer_right):
+        center = self._base_center(base_corner)
+        # filter into our angular sector
+        pool = [g for g in greens if self._in_sector(base_corner, g, prefer_right)]
+        if not pool: pool = list(greens)  # fallback
+        # rank by *radial distance to base center* (closest to score first)
+        pool.sort(key=lambda g: self._dist(g, center))
+        return pool[0] if pool else None
+
+    # ============================ MAIN ============================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        self._tick += 1
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        center = self._base_center(own_base)
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # EGRESS if inside any base
+        for corner, margin in [(own_base, 0.0), (enemy_base, self.ENEMY_KEEP_OUT)]:
+            xmin, xmax, ymin, ymax = self._base_rect(corner, margin)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                if self._egress_ticks == 0:
+                    self._start_egress_from(corner)
+                break
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            tgt = self._add(self._egress_target(self._egress_from), self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, tgt)
+
+        # OPENING SPLIT: run to distinct tangent staging points to avoid initial teammate collision
+        if self._tick <= self.OPENING_TICKS:
+            ax, ay = self._base_axes(own_base)
+            inward = self._norm(self._add(ax, ay))          # diagonal into the field
+            tangent = self._perp(inward)                    # along the base mouth
+            side = -1.0 if (self._index % 2 == 0) else 1.0  # even -> left, odd -> right
+            staging = self._add(center, self._add(self._mul(tangent, side*0.28),
+                                                  self._mul(inward, 0.06)))
+            staging = self._clamp_pt(staging)
+            tgt = self._add(staging, self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, tgt)
+
+        # PICK / KEEP LOCKED GREEN strictly by radial closeness in our sector
+        prefer_right = (self._index % 2 == 1)
+        pick = self._pick_green_in_sector(own_pos, green_coords, own_base, prefer_right)
+
+        if self._lock is None:
+            self._lock = pick
+            self._push_mode = False
+        else:
+            # refresh lock if the same ball is still around
+            same = None
+            for g in green_coords:
+                if self._dist(g, self._lock) <= self.LOCK_TOL:
+                    same = g; break
+            if same is not None:
+                self._lock = same
+            else:
+                # consider switching only if clearly better
+                if pick is not None:
+                    ap_new, _ = self._approach_point(pick, center)
+                    ap_cur, _ = self._approach_point(self._lock, center)
+                    if self._dist(own_pos, ap_new) + 0.5*self._dist(pick, center) + self.REPLACE_MARGIN < \
+                       self._dist(own_pos, ap_cur) + 0.5*self._dist(self._lock, center):
+                        self._lock = pick
+                        self._push_mode = False
+                else:
+                    self._lock = None
+                    self._push_mode = False
+
+        # If no green -> idle
+        if self._lock is None:
+            park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, park)
+
+        # EXECUTE: approach -> push to base center
+        ap, to_goal = self._approach_point(self._lock, center)
+        ap = self._keep_out_enemy_base(ap, enemy_base)
+
+        # enter push when close & aligned
+        if not self._push_mode:
+            desired = self._m.atan2(to_goal[1], to_goal[0])
+            err = (desired - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+            if (self._dist(own_pos, self._lock) <= self.CAPTURE_R) and (abs(err) <= self._m.radians(self.ALIGN_PUSH_DEG)):
+                self._push_mode = True
+
+        # if inside our base while pushing, schedule egress next loop
+        xmin, xmax, ymin, ymax = self._base_rect(own_base, 0.0)
+        if self._push_mode and (xmin <= own_pos[0] <= xmax) and (ymin <= own_pos[1] <= ymax):
+            if self._egress_ticks == 0:
+                self._start_egress_from(own_base)
+
+        target = center if self._push_mode else ap
+        target = self._add(target, self._nudge(own_pos, bot_coords))
+        return self._drive(own_pos, own_dir, target)
+
+@register_bot
+class KickerLane:
+    """
+    Kicker-lane harvester (opponent-agnostic, no retarget chatter).
+
+    Core ideas
+    ----------
+    • FIXED LANES: bots never face each other. Even index drives the lane CLOCKWISE
+      around its own base; odd index drives COUNTER-CLOCKWISE. Each bot only takes
+      balls in its angular half-sector about the base center. This kills the “meet
+      in the middle and ping-pong” issue.
+    • KICK, DON’T CHAPERONE: approach from OUTSIDE the ball and pass THROUGH the ball
+      toward our base center by a small depth (“kick-through”), then immediately peel
+      back onto the lane for the next target. We don’t follow the ball all the way in.
+    • OPENING FAN-OUT: first ~0.5 s each bot runs to a distinct tangent point on its lane.
+    • SIMPLE SAFETY: quick egress if we ever end up inside any base; tiny low-pass on
+      wheel speeds to kill oscillation.
+
+    Returns [left, right] in [-1, 1]. No external helpers needed besides get_base_coords.
+    """
+
+    # Arena / base
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+    WALL_M = 0.05
+
+    # Controller
+    TURN_GAIN = 1.40
+    ALIGN_TURN_ONLY = 82.0  # deg
+    MAX_SPEED = 1.0
+    LPF_ALPHA = 0.75
+
+    # Lane / sector geometry
+    RING_R = 0.36           # lane radius from our base center (m)
+    SECTOR_BIAS = 0.06      # tiny bias to break mirror symmetry
+
+    # Kicking behavior
+    APPROACH_OFFSET = 0.10  # start behind ball along outward radial dir (m)
+    THROUGH_IN      = 0.08  # continue this far PAST the ball toward base (m)
+    CAPTURE_R       = 0.065 # if we're this close, assume contact for kick
+
+    # Opening fan-out & egress
+    OPENING_TICKS = 120     # ~0.5s @ 240Hz control
+    EGRESS_DIST = 0.40
+    EGRESS_TICKS = 44
+    ENEMY_KEEP_OUT = 0.10
+
+    # Separation / walls
+    SEP_RADIUS = 0.18
+    SEP_GAIN   = 0.08
+
+    # Stuck recovery
+    HIST_N = 30
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS = 24
+
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._m = math
+        self._index = index
+        self._cw = (index % 2 == 0)        # even = clockwise lane, odd = counter-clockwise
+        self._tick = 0
+        self._target_ball = None           # locked green
+        self._kicking = False              # in kick-through phase
+        self._egress_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+        self._u_prev = [0.0, 0.0]
+
+    # -------- tiny vec utils --------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a)
+        return (0.0,0.0) if L==0 else (a[0]/L, a[1]/L)
+    def _perp(self,a): return (-a[1], a[0])
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp(self,x,lo,hi): return lo if x<lo else hi if x>hi else x
+    def _clamp_pt(self,p):
+        return (self._clamp(p[0], self.WALL_M, self.ARENA_W-self.WALL_M),
+                self._clamp(p[1], self.WALL_M, self.ARENA_H-self.WALL_M))
+
+    # -------- base helpers --------
+    def _own_base(self): return get_base_coords(self._index)
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0),(self.ARENA_W,0.0),(0.0,self.ARENA_H),(self.ARENA_W,self.ARENA_H)]
+        return max(corners, key=lambda c: self._dist(c,(bx,by)))
+    def _base_axes(self, corner):
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        return (ix,0.0),(0.0,iy)
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+    def _base_rect(self, corner, margin=0.0):
+        ax, ay = self._base_axes(corner)
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+
+    # -------- controller (LPF) --------
+    def _drive(self, own_pos, own_dir, target):
+        dx, dy = target[0]-own_pos[0], target[1]-own_pos[1]
+        if dx == 0.0 and dy == 0.0:
+            cmd = [0.0, 0.0]
+        else:
+            t_ang = self._m.atan2(dy, dx)
+            err = (t_ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+            if abs(err) > self._m.radians(self.ALIGN_TURN_ONLY):
+                fwd = 0.0
+            else:
+                fwd = self.MAX_SPEED * max(0.0, self._m.cos(err))
+            turn = self.TURN_GAIN * err
+            l = fwd - turn; r = fwd + turn
+            mag = max(1.0, abs(l), abs(r))
+            cmd = [l/mag, r/mag]
+        a = self.LPF_ALPHA
+        out = [a*self._u_prev[0] + (1-a)*cmd[0],
+               a*self._u_prev[1] + (1-a)*cmd[1]]
+        self._u_prev = out
+        return out
+
+    # -------- lane helpers --------
+    def _angle(self, c, p): return self._m.atan2(p[1]-c[1], p[0]-c[0])
+    def _angdiff_signed(self, a, b):
+        d = (a - b + self._m.pi) % (2*self._m.pi) - self._m.pi
+        return d
+    def _ring_point(self, c, ang):
+        return (c[0] + self.RING_R*self._m.cos(ang), c[1] + self.RING_R*self._m.sin(ang))
+
+    # -------- sector filter (about base center) --------
+    def _prefer_right(self): return (self._index % 2 == 1)
+    def _in_sector(self, base_corner, p):
+        center = self._base_center(base_corner)
+        ax, ay = self._base_axes(base_corner)
+        inward = self._norm(self._add(ax, ay))
+        tangent = self._perp(inward)
+        # projection onto tangent through center
+        s = (p[0]-center[0])*tangent[0] + (p[1]-center[1])*tangent[1]
+        bias = self.SECTOR_BIAS if self._prefer_right() else -self.SECTOR_BIAS
+        # world-X bias to break exact symmetry
+        if self._prefer_right():
+            return s >= 0.0 or p[0] > center[0] + bias
+        else:
+            return s <= 0.0 or p[0] < center[0] + bias
+
+    # -------- choose next ball by oriented ANGLE along lane --------
+    def _choose_ball_on_lane(self, own_pos, greens, base_corner):
+        center = self._base_center(base_corner)
+        # Only consider balls in our sector to avoid mate conflicts
+        pool = [g for g in greens if self._in_sector(base_corner, g)]
+        if not pool: pool = list(greens)
+        if not pool: return None
+
+        my_ang = self._angle(center, own_pos)
+        # We want the ball with smallest positive (CW or CCW) angular delta along the lane
+        def oriented_delta(g):
+            a = self._angle(center, g)
+            d = self._angdiff_signed(a, my_ang)
+            if self._cw:
+                # CW means negative (clockwise) angles are "ahead"; wrap positives to negative domain
+                if d > 0: d -= 2*self._m.pi
+                return abs(d)
+            else:
+                # CCW means positive angles are ahead
+                if d < 0: d += 2*self._m.pi
+                return abs(d)
+
+        # Tie-break by smaller radial distance (closer to base -> easier score)
+        pool.sort(key=lambda g: (oriented_delta(g), self._dist(g, center)))
+        return pool[0]
+
+    # -------- kick-through targets --------
+    def _kick_targets(self, ball, base_corner):
+        center = self._base_center(base_corner)
+        # outward radial dir (from center to ball)
+        out = self._norm(self._sub(ball, center))
+        if out == (0.0,0.0): out = (1.0, 0.0)
+        # behind point (approach from OUTSIDE)
+        approach = self._add(ball, self._mul(out, self.APPROACH_OFFSET))
+        # through point (a bit INSIDE toward the base)
+        through = self._add(ball, self._mul(out, -self.THROUGH_IN))
+        return self._clamp_pt(approach), self._clamp_pt(through)
+
+    # -------- tiny nudges --------
+    def _nudge(self, own_pos, bot_coords):
+        n = (0.0,0.0)
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = self._dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = self._norm(self._sub(own_pos, mate_pos))
+                n = self._add(n, self._mul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        # wall soften
+        x,y = own_pos
+        if x < self.WALL_M: n = self._add(n, ( self.SEP_GAIN*(self.WALL_M-x)/self.WALL_M, 0.0))
+        if self.ARENA_W - x < self.WALL_M: n = self._add(n, (-self.SEP_GAIN*(self.WALL_M-(self.ARENA_W-x))/self.WALL_M, 0.0))
+        if y < self.WALL_M: n = self._add(n, (0.0,  self.SEP_GAIN*(self.WALL_M-y)/self.WALL_M))
+        if self.ARENA_H - y < self.WALL_M: n = self._add(n, (0.0, -self.SEP_GAIN*(self.WALL_M-(self.ARENA_H-y))/self.WALL_M))
+        return n
+
+    # -------- stuck & egress --------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0; prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp(-0.55 - 0.30*s, -1, 1), self._clamp(-0.55 + 0.30*s, -1, 1)]
+    def _start_egress_from(self, corner):
+        self._egress_ticks = self.EGRESS_TICKS
+        self._egress_from = corner
+    def _egress_target(self, corner):
+        center = self._base_center(corner)
+        out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+        return self._clamp_pt(self._add(center, self._mul(out, self.EGRESS_DIST)))
+
+    # -------- idling --------
+    def getWaitPosition(self):
+        # sit roughly on our ring, offset by lane direction
+        center = self._base_center(self._own_base())
+        base_ang = self._angle(center, self._own_base())
+        ang = base_ang + ( -self._m.pi/4 if self._cw else self._m.pi/4 )
+        return self._ring_point(center, ang)
+
+    # ============================ MAIN ============================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        self._tick += 1
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        center = self._base_center(own_base)
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # EGRESS if inside any base
+        for corner, margin in [(own_base, 0.0), (enemy_base, self.ENEMY_KEEP_OUT)]:
+            xmin, xmax, ymin, ymax = self._base_rect(corner, margin)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                if self._egress_ticks == 0:
+                    self._start_egress_from(corner)
+                break
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            tgt = self._add(self._egress_target(self._egress_from), self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, tgt)
+
+        # OPENING FAN-OUT to distinct lane tangents
+        if self._tick <= self.OPENING_TICKS:
+            ax, ay = self._base_axes(own_base)
+            inward = self._norm(self._add(ax, ay))
+            tangent = self._perp(inward)
+            side = (-1.0 if self._cw else 1.0)
+            staging = self._add(center, self._add(self._mul(tangent, side*0.28),
+                                                  self._mul(inward, 0.06)))
+            staging = self._clamp_pt(staging)
+            tgt = self._add(staging, self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, tgt)
+
+        # CHOOSE / KEEP target ball strictly by oriented angle along the lane
+        if (self._target_ball is None) or (all(self._dist(g, self._target_ball) > self.CAPTURE_R*1.1 for g in green_coords)):
+            self._kicking = False
+            self._target_ball = self._choose_ball_on_lane(own_pos, green_coords, own_base)
+
+        # If no greens left -> idle on lane
+        if self._target_ball is None:
+            park = self.getWaitPosition()
+            park = self._add(park, self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, park)
+
+        # Compute kick-through waypoints
+        approach, through = self._kick_targets(self._target_ball, own_base)
+
+        # If very close to ball, begin/continue the KICK phase
+        if self._dist(own_pos, self._target_ball) <= self.CAPTURE_R:
+            self._kicking = True
+
+        # During KICK: drive to 'through' (a little inside toward base), then immediately release target
+        if self._kicking:
+            tgt = self._add(through, self._nudge(own_pos, bot_coords))
+            cmd = self._drive(own_pos, own_dir, tgt)
+            # Release once we pass near 'through' or drift into our base (egress will pull us out)
+            if self._dist(own_pos, through) <= 0.04:
+                self._kicking = False
+                self._target_ball = None
+            return cmd
+
+        # Not kicking yet: drive to 'approach' (OUTSIDE the ball), but stay on lane side
+        # Snap the approach point onto our lane ring angle to avoid head-on with mate
+        ang_ball = self._angle(center, self._target_ball)
+        lane_ang = ang_ball
+        # bias a tiny bit along lane direction so both bots never converge head-on
+        lane_ang += (-0.06 if self._cw else 0.06)
+        lane_pt = self._ring_point(center, lane_ang)
+        # blend between pure behind-ball approach and lane point
+        ap = self._add(self._mul(approach, 0.6), self._mul(lane_pt, 0.4))
+        ap = self._clamp_pt(ap)
+
+        ap = self._add(ap, self._nudge(own_pos, bot_coords))
+        return self._drive(own_pos, own_dir, ap)
+
+@register_bot
+class DWABot:
+    """
+    Velocity-sampling (DWA-lite) collector.
+    - No opponent modeling. Focus: smooth arcs (no wiggle) and no early teammate collisions.
+    - Even index starts immediately; odd index pauses briefly to deconflict the opening.
+    - Chooses a single ball (SimpleBot-like heuristic), builds a behind-the-ball target,
+      then samples wheel velocities and rolls them out ~0.1s to pick the best command.
+
+    Returns [left, right] in [-1, 1].
+    """
+
+    # ---- Arena / base ----
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+
+    # ---- Opening & egress ----
+    OPENING_DELAY_TICKS = 20     # odd index waits ~0.08s (60 FPS * T_SCALE=4)
+    ENEMY_KEEP_OUT = 0.10
+    EGRESS_DIST = 0.40
+    EGRESS_TICKS = 44
+
+    # ---- Ball handling ----
+    APPROACH_OFFSET = 0.09
+    CAPTURE_R = 0.065
+    LOCK_TOL = 0.06
+
+    # ---- DWA (kinematics assumed; relative scaling only) ----
+    DT = 1.0 / (60.0 * 4.0)      # simulator timestep
+    HORIZON_STEPS = 24           # ~0.1 s
+    WHEEL_BASE = 0.11            # ~robot width
+    VMAX_MPS = 0.9               # relative speed scale (only used for ranking)
+    SAMPLE_SET = (-1.0, -0.5, -0.2, 0.2, 0.5, 1.0)
+
+    # ---- DWA scoring weights ----
+    W_TARGET = 1.0       # distance to target (lower is better)
+    W_ALIGN  = 0.5       # heading error to target direction
+    W_FWD    = 0.8       # forward progress along target ray (higher is better)
+    W_WALL   = 0.8       # penalty for proximity to walls
+    W_MATE   = 1.2       # penalty for being near teammate next pose
+    WALL_M   = 0.05
+
+    # ---- Controller smoothing ----
+    LPF_ALPHA = 0.75
+
+    # ---- Stuck recovery ----
+    HIST_N = 30
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS = 24
+
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._m = math
+        self._index = index
+        self._tick = 0
+        self._lock_kind = None  # 'red' or 'green'
+        self._lock_pos = None
+        self._egress_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+        self._u_prev = [0.0, 0.0]
+
+    # ---------- tiny vec utils ----------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a);
+        return (0.0,0.0) if L==0 else (a[0]/L, a[1]/L)
+    def _perp(self,a): return (-a[1], a[0])
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp(self,x,lo,hi): return lo if x<lo else hi if x>hi else x
+    def _clamp_pt(self,p):
+        return (self._clamp(p[0], self.WALL_M, self.ARENA_W - self.WALL_M),
+                self._clamp(p[1], self.WALL_M, self.ARENA_H - self.WALL_M))
+
+    # ---------- bases ----------
+    def _own_base(self): return get_base_coords(self._index)
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0),(self.ARENA_W,0.0),(0.0,self.ARENA_H),(self.ARENA_W,self.ARENA_H)]
+        return max(corners, key=lambda c: self._dist(c,(bx,by)))
+    def _base_axes(self, corner):
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        return (ix,0.0),(0.0,iy)
+    def _base_rect(self, corner, margin=0.0):
+        ax, ay = self._base_axes(corner)
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+
+    # ---------- selection (SimpleBot-like) ----------
+    def _simple_candidates(self, own_pos, own_base, greens, reds):
+        own_base_dist = self._dist(own_base, own_pos)
+        reds_ok   = [r for r in reds if self._dist(own_base, r) > own_base_dist]
+        greens_ok = [g for g in greens if self._dist(own_base, g) < own_base_dist]
+        reds_ok.sort(key=lambda p: self._dist(own_pos, p))
+        greens_ok.sort(key=lambda p: self._dist(own_pos, p))
+        if reds_ok:
+            #return 'red', (reds_ok[0] if (self._index % 2 == 0) else reds_ok[min(1,len(reds_ok)-1)])
+            return 'red', reds_ok[0] 
+        if greens_ok:
+            #return 'green', (greens_ok[0] if (self._index % 2 == 0) else greens_ok[min(1,len(greens_ok)-1)])
+            return 'green', greens_ok[0]
+        # fallback: nearest green overall
+        if greens:
+            gs = sorted(greens, key=lambda p: self._dist(own_pos, p))
+            return 'green', gs[0]
+        return None, None
+
+    # ---------- target construction ----------
+    def _approach_point(self, ball, goal_point):
+        to_goal = self._norm(self._sub(goal_point, ball))
+        if to_goal == (0.0,0.0): to_goal = (1.0,0.0)
+        ap = self._add(ball, self._mul(to_goal, -self.APPROACH_OFFSET))
+        return self._clamp_pt(ap), to_goal
+
+    def _keep_out_enemy_base(self, p, enemy_corner):
+        xmin, xmax, ymin, ymax = self._base_rect(enemy_corner, margin=self.ENEMY_KEEP_OUT)
+        if xmin <= p[0] <= xmax and ymin <= p[1] <= ymax:
+            center = self._base_center(enemy_corner)
+            out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+            p = self._add(center, self._mul(out, self.EGRESS_DIST*0.6))
+        return self._clamp_pt(p)
+
+    # ---------- DWA rollout ----------
+    def _rollout(self, pose, lv, rv):
+        # pose = (x,y,theta). Apply lv,rv for HORIZON_STEPS*DT.
+        x,y,th = pose
+        v_l = lv * self.VMAX_MPS
+        v_r = rv * self.VMAX_MPS
+        v = 0.5*(v_l + v_r)
+        w = (v_r - v_l) / max(1e-6, self.WHEEL_BASE)
+        dt = self.DT
+        for _ in range(self.HORIZON_STEPS):
+            th += w * dt
+            x  += v * self._m.cos(th) * dt
+            y  += v * self._m.sin(th) * dt
+            # clamp to arena (softly)
+            x = self._clamp(x, 0.0 + self.WALL_M, self.ARENA_W - self.WALL_M)
+            y = self._clamp(y, 0.0 + self.WALL_M, self.ARENA_H - self.WALL_M)
+        return (x,y,th)
+
+    def _score(self, start_pose, lv, rv, target, mate_pos):
+        x,y,th = self._rollout(start_pose, lv, rv)
+        # distance to target
+        d_tgt = self._dist((x,y), target)
+        # heading alignment to target ray
+        ray = self._norm(self._sub(target, (x,y)))
+        align_err = abs(self._m.atan2(ray[1], ray[0]) - th)
+        align_err = (align_err + self._m.pi) % (2*self._m.pi) - self._m.pi
+        align_err = abs(align_err)
+        # forward progress along initial ray
+        init_ray = self._norm(self._sub(target, (start_pose[0], start_pose[1])))
+        progress = ( (x - start_pose[0]) * init_ray[0] + (y - start_pose[1]) * init_ray[1] )
+        # wall penalty (closer than WALL_M is already clamped; still add margin)
+        wall_pen = min(x, self.ARENA_W-x, y, self.ARENA_H-y)
+        wall_pen = max(0.0, (self.WALL_M*1.5 - wall_pen)) / (self.WALL_M*1.5)
+        # mate penalty
+        mate_pen = 0.0
+        if mate_pos is not None:
+            dm = self._dist((x,y), mate_pos)
+            if dm < 0.18:
+                mate_pen = (0.18 - dm) / 0.18
+        # total (lower better)
+        return ( self.W_TARGET * d_tgt
+               + self.W_ALIGN  * align_err
+               - self.W_FWD    * progress
+               + self.W_WALL   * wall_pen
+               + self.W_MATE   * mate_pen )
+
+    # ---------- controller w/ LPF ----------
+    def _drive(self, own_pos, own_dir, target):
+        # Low-level: select best (lv,rv) by sampling
+        # Mate pos for penalty
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        mate_pos = None
+        # note: bot_coords is not available here; we pass mate_pos in caller
+        # so this function accepts only target; mate handled in caller.
+        raise NotImplementedError("Use _drive_with_mate from get_controls.")
+
+    def _drive_with_mate(self, own_pos, own_dir, target, mate_pos):
+        best = None
+        pose = (own_pos[0], own_pos[1], own_dir)
+        for lv in self.SAMPLE_SET:
+            for rv in self.SAMPLE_SET:
+                score = self._score(pose, lv, rv, target, mate_pos)
+                if (best is None) or (score < best[0]):
+                    best = (score, lv, rv)
+        lv, rv = best[1], best[2]
+        # LPF
+        a = self.LPF_ALPHA
+        out = [a*self._u_prev[0] + (1-a)*lv,
+               a*self._u_prev[1] + (1-a)*rv]
+        # clamp
+        out = [self._clamp(out[0], -1, 1), self._clamp(out[1], -1, 1)]
+        self._u_prev = out
+        return out
+
+    # ---------- stuck & egress ----------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0; prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp(-0.55 - 0.30*s, -1, 1), self._clamp(-0.55 + 0.30*s, -1, 1)]
+    def _start_egress_from(self, corner):
+        self._egress_ticks = self.EGRESS_TICKS
+        self._egress_from = corner
+    def _egress_target(self, corner):
+        center = self._base_center(corner)
+        out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+        tgt = self._add(center, self._mul(out, self.EGRESS_DIST))
+        return self._clamp_pt(tgt)
+
+    # ---------- idling ----------
+    def getWaitPosition(self):
+        return (0.48, 1.08) if self._index < 2 else (1.08, 0.48)
+
+    # ============================ MAIN ============================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        self._tick += 1
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        center = self._base_center(own_base)
+
+        # Opening delay for odd index to avoid immediate teammate clash
+        if (self._index % 2 == 1) and (self._tick <= self.OPENING_DELAY_TICKS):
+            return [0.0, 0.0]
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # EGRESS if inside any base
+        for corner, margin in [(own_base, 0.0), (enemy_base, self.ENEMY_KEEP_OUT)]:
+            xmin, xmax, ymin, ymax = self._base_rect(corner, margin)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                if self._egress_ticks == 0:
+                    self._start_egress_from(corner)
+                break
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+            mate_pos = bot_coords[mate][0] if 0 <= mate < len(bot_coords) else None
+            tgt = self._egress_target(self._egress_from)
+            return self._drive_with_mate(own_pos, own_dir, tgt, mate_pos)
+
+        # -------- Acquire/keep lock (SimpleBot-flavored) --------
+        kind, ball = self._simple_candidates(own_pos, own_base, green_coords, red_coords)
+        if self._lock_pos is None or self._lock_kind is None:
+            if ball is None:
+                mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+                mate_pos = bot_coords[mate][0] if 0 <= mate < len(bot_coords) else None
+                park = self.getWaitPosition()
+                return self._drive_with_mate(own_pos, own_dir, park, mate_pos)
+            self._lock_kind, self._lock_pos = kind, ball
+        else:
+            # refresh lock if same ball exists
+            balls = red_coords if self._lock_kind=='red' else green_coords
+            same = None
+            for b in balls:
+                if self._dist(b, self._lock_pos) <= self.LOCK_TOL:
+                    same = b; break
+            if same is not None:
+                self._lock_pos = same
+            elif ball is not None:
+                self._lock_kind, self._lock_pos = kind, ball
+            else:
+                self._lock_kind, self._lock_pos = None, None
+
+        # If no ball -> idle
+        if self._lock_pos is None:
+            mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+            mate_pos = bot_coords[mate][0] if 0 <= mate < len(bot_coords) else None
+            park = self.getWaitPosition()
+            return self._drive_with_mate(own_pos, own_dir, park, mate_pos)
+
+        # -------- Build target (approach vs push) --------
+        goal_point = enemy_base if self._lock_kind == 'red' else center
+        ap, _ = self._approach_point(self._lock_pos, goal_point)
+        ap = self._keep_out_enemy_base(ap, enemy_base)
+
+        # choose: if close to ball, push to goal; else go to approach
+        target = goal_point if (self._dist(own_pos, self._lock_pos) <= self.CAPTURE_R) else ap
+
+        # DWA-driven command toward target with mate penalty
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        mate_pos = bot_coords[mate][0] if 0 <= mate < len(bot_coords) else None
+        return self._drive_with_mate(own_pos, own_dir, target, mate_pos)
+
+
+@register_bot
+class SpiralShepherd:
+    """
+    Opponent-agnostic, coverage-style bot.
+
+    Idea:
+      • Each bot follows an outward→inward ARCHIMEDEAN SPIRAL around its own base center (even = CW, odd = CCW).
+      • While sweeping, if a GREEN lies near the current spiral ray, temporarily deviate to a short
+        "radial kick": approach from OUTSIDE the ball and push slightly inward toward the base center,
+        then immediately resume the spiral (no long chaperoning).
+      • Hard egress if we ever end up in any base. Low-pass wheel commands suppress wiggle.
+      • Opening deconflict: odd index waits briefly so teammates don’t meet head-on at t=0.
+
+    Why this is different:
+      • No target auctioning or nearest-ball retarget chatter.
+      • Global, time-parameterized path (the spiral) guarantees coverage & keeps teammates apart
+        by direction and phase — reducing mid-field ping-pong.
+    """
+
+    # ---- Arena / base ----
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+    WALL_M = 0.05
+
+    # ---- Spiral parameters (about our base center) ----
+    R_MIN = 0.28            # stay just outside our base square (~0.2*sqrt(2))
+    R_MAX = 0.72            # do not hug far walls
+    OMEGA_PER_TICK = 0.006  # radians advanced each tick along spiral (~1.4 rad/s @ 240 Hz)
+    # r(theta) = r0 - K*(theta - theta0); one full turn reduces radius by (R_MAX - R_MIN)
+    # => K = (R_MAX - R_MIN) / (2π)
+    # We compute K once in __init__.
+
+    # ---- Kick behavior (quick radial push, then resume spiral) ----
+    ARC_CATCH_DEG = 32.0    # ball must lie within this angular window of the spiral ray
+    R_BAND = 0.12           # and within this radial band around current r
+    APPROACH_OUT = 0.10     # approach from OUTSIDE (radially outward from base center)
+    THROUGH_IN   = 0.07     # push slightly INWARD then release
+    CAPTURE_R    = 0.065    # consider ball "in contact" at this distance
+
+    # ---- Controller (with low-pass) ----
+    TURN_GAIN = 1.45
+    ALIGN_TURN_ONLY = 82.0  # deg; rotate-in-place if worse than this
+    MAX_SPEED = 1.0
+    LPF_ALPHA = 0.75
+
+    # ---- Opening & egress ----
+    OPENING_DELAY_TICKS = 18   # odd index waits ~0.075 s (60 FPS * T_SCALE=4)
+    ENEMY_KEEP_OUT = 0.10
+    EGRESS_DIST = 0.40
+    EGRESS_TICKS = 44
+
+    # ---- Separation (mate + walls) ----
+    SEP_RADIUS = 0.18
+    SEP_GAIN   = 0.08
+
+    # ---- Stuck recovery ----
+    HIST_N = 30
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS = 24
+
+    # ========================= impl =========================
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._m = math
+        self._index = index
+        self._cw = (index % 2 == 0)      # even = clockwise spiral
+        self._tick = 0
+        self._egress_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+        self._u_prev = [0.0, 0.0]
+
+        # Spiral state
+        self._theta = (-math.pi/6) if self._cw else (+math.pi/6)  # slight phase offset per bot
+        self._r0 = self.R_MAX
+        self._theta0 = self._theta
+        self._K = (self.R_MAX - self.R_MIN) / (2.0 * math.pi)
+
+        # Kick state
+        self._kicking = False
+        self._kick_through = None  # point inside toward which we push before releasing
+
+    # ---------- tiny vec utils ----------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a)
+        return (0.0,0.0) if L==0 else (a[0]/L, a[1]/L)
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp(self,x,lo,hi): return lo if x<lo else hi if x>hi else x
+    def _clamp_pt(self,p):
+        return (self._clamp(p[0], self.WALL_M, self.ARENA_W - self.WALL_M),
+                self._clamp(p[1], self.WALL_M, self.ARENA_H - self.WALL_M))
+
+    # ---------- bases ----------
+    def _own_base(self): return get_base_coords(self._index)
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0),(self.ARENA_W,0.0),(0.0,self.ARENA_H),(self.ARENA_W,self.ARENA_H)]
+        return max(corners, key=lambda c: self._dist(c,(bx,by)))
+    def _base_axes(self, corner):
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        return (ix,0.0),(0.0,iy)
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+    def _base_rect(self, corner, margin=0.0):
+        ax, ay = self._base_axes(corner)
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+
+    # ---------- controller (LPF) ----------
+    def _drive(self, own_pos, own_dir, target):
+        dx, dy = target[0]-own_pos[0], target[1]-own_pos[1]
+        if dx == 0.0 and dy == 0.0:
+            cmd = [0.0, 0.0]
+        else:
+            t_ang = self._m.atan2(dy, dx)
+            err = (t_ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+            if abs(err) > self._m.radians(self.ALIGN_TURN_ONLY):
+                fwd = 0.0
+            else:
+                fwd = self.MAX_SPEED * max(0.0, self._m.cos(err))
+            turn = self.TURN_GAIN * err
+            l = fwd - turn; r = fwd + turn
+            mag = max(1.0, abs(l), abs(r))
+            cmd = [l/mag, r/mag]
+        a = self.LPF_ALPHA
+        out = [a*self._u_prev[0] + (1-a)*cmd[0],
+               a*self._u_prev[1] + (1-a)*cmd[1]]
+        self._u_prev = out
+        return out
+
+    # ---------- separation ----------
+    def _nudge(self, own_pos, bot_coords):
+        n = (0.0,0.0)
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = self._dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = self._norm(self._sub(own_pos, mate_pos))
+                n = self._add(n, self._mul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        # walls
+        x,y = own_pos
+        if x < self.WALL_M: n = self._add(n, ( self.SEP_GAIN*(self.WALL_M-x)/self.WALL_M, 0.0))
+        if self.ARENA_W - x < self.WALL_M: n = self._add(n, (-self.SEP_GAIN*(self.WALL_M-(self.ARENA_W-x))/self.WALL_M, 0.0))
+        if y < self.WALL_M: n = self._add(n, (0.0,  self.SEP_GAIN*(self.WALL_M-y)/self.WALL_M))
+        if self.ARENA_H - y < self.WALL_M: n = self._add(n, (0.0, -self.SEP_GAIN*(self.WALL_M-(self.ARENA_H-y))/self.WALL_M))
+        return n
+
+    # ---------- stuck & egress ----------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0; prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp(-0.55 - 0.30*s, -1, 1), self._clamp(-0.55 + 0.30*s, -1, 1)]
+    def _start_egress_from(self, corner):
+        self._egress_ticks = self.EGRESS_TICKS
+        self._egress_from = corner
+    def _egress_target(self, corner):
+        center = self._base_center(corner)
+        out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+        return self._clamp_pt(self._add(center, self._mul(out, self.EGRESS_DIST)))
+
+    # ---------- utility ----------
+    def _angle(self, c, p): return self._m.atan2(p[1]-c[1], p[0]-c[0])
+    def _ring_point(self, c, r, ang): return (c[0] + r*self._m.cos(ang), c[1] + r*self._m.sin(ang))
+
+    def _spiral_target(self, center):
+        # advance theta
+        self._theta += ( -self.OMEGA_PER_TICK if self._cw else self.OMEGA_PER_TICK )
+        # compute radius by r = r0 - K*(theta - theta0)
+        r = self._r0 - self._K * (self._theta - self._theta0)
+        # when we reach R_MIN, reset to R_MAX and keep spinning
+        if r <= self.R_MIN:
+            self._r0 = self.R_MAX
+            self._theta0 = self._theta
+            r = self.R_MAX
+        # clamp extreme (safety)
+        r = self._clamp(r, self.R_MIN, self.R_MAX)
+        return self._ring_point(center, r, self._theta), r
+
+    def _near_spiral_ray(self, center, r_now, theta_now, ball):
+        # ball near current ray if within angular window and radial band
+        ang_b = self._angle(center, ball)
+        d_ang = (ang_b - theta_now + self._m.pi) % (2*self._m.pi) - self._m.pi
+        if self._cw:  # ahead in CW means negative delta
+            ahead = d_ang <= self._m.radians(self.ARC_CATCH_DEG)
+        else:         # ahead in CCW means positive delta
+            ahead = d_ang >= -self._m.radians(self.ARC_CATCH_DEG)
+        if abs(d_ang) > self._m.radians(self.ARC_CATCH_DEG): return False
+        rb = self._dist(ball, center)
+        return ahead and (abs(rb - r_now) <= self.R_BAND)
+
+    def _kick_waypoints(self, center, ball):
+        # outward dir from center to ball
+        out = self._norm(self._sub(ball, center))
+        if out == (0.0,0.0): out = (1.0,0.0)
+        approach = self._add(ball, self._mul(out, self.APPROACH_OUT))
+        through  = self._add(ball, self._mul(out, -self.THROUGH_IN))
+        return self._clamp_pt(approach), self._clamp_pt(through)
+
+    # ---------- idling ----------
+    def getWaitPosition(self):
+        # sit on a ring near R_MIN + margin at our current theta
+        center = self._base_center(self._own_base())
+        r = (self.R_MIN + 0.06)
+        return self._ring_point(center, r, self._theta)
+
+    # ============================ MAIN ============================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        self._tick += 1
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        center = self._base_center(own_base)
+
+        # Opening deconflict
+        if (self._index % 2 == 1) and (self._tick <= self.OPENING_DELAY_TICKS):
+            return [0.0, 0.0]
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # EGRESS if inside any base
+        for corner, margin in [(own_base, 0.0), (enemy_base, self.ENEMY_KEEP_OUT)]:
+            xmin, xmax, ymin, ymax = self._base_rect(corner, margin)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                if self._egress_ticks == 0:
+                    self._start_egress_from(corner)
+                break
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            tgt = self._add(self._egress_target(self._egress_from), self._nudge(own_pos, bot_coords))
+            return self._drive(own_pos, own_dir, tgt)
+
+        # If in KICK phase, continue toward 'through' and release once passed
+        if self._kicking and self._kick_through is not None:
+            tgt = self._add(self._kick_through, self._nudge(own_pos, bot_coords))
+            cmd = self._drive(own_pos, own_dir, tgt)
+            if self._dist(own_pos, self._kick_through) <= 0.04:
+                self._kicking = False
+                self._kick_through = None
+            return cmd
+
+        # Compute current spiral target (smooth coverage path)
+        spiral_tgt, r_now = self._spiral_target(center)
+        theta_now = self._theta
+
+        # Check for a GREEN near the current spiral ray (fast local heuristic)
+        candidate = None
+        best_da = None
+        for g in green_coords:
+            if self._near_spiral_ray(center, r_now, theta_now, g):
+                # prefer the one most "ahead" along our rotation
+                ang_g = self._angle(center, g)
+                d_ang = (ang_g - theta_now + self._m.pi) % (2*self._m.pi) - self._m.pi
+                da = abs(d_ang)
+                if (best_da is None) or (da < best_da):
+                    best_da = da
+                    candidate = g
+
+        # If we have a candidate close to our nose, start/attempt a KICK
+        if candidate is not None:
+            approach, through = self._kick_waypoints(center, candidate)
+            # If already at contact range, go straight to through; else aim to approach
+            if self._dist(own_pos, candidate) <= self.CAPTURE_R:
+                self._kicking = True
+                self._kick_through = through
+                tgt = self._add(through, self._nudge(own_pos, bot_coords))
+                return self._drive(own_pos, own_dir, tgt)
+            else:
+                tgt = self._add(approach, self._nudge(own_pos, bot_coords))
+                return self._drive(own_pos, own_dir, tgt)
+
+        # No kick target right now: continue following spiral
+        tgt = self._add(spiral_tgt, self._nudge(own_pos, bot_coords))
+        return self._drive(own_pos, own_dir, tgt)
+
+@register_bot
+class EfficientDWABot:
+    """
+    DWA-style planner, but much lighter and more purposeful.
+
+    What’s new vs DWABot
+    --------------------
+    • Two–stage sampling (coarse → local refine) around the best command from last tick.
+      ~18 rollouts/tick by default (vs 36), so it’s faster.
+    • Stage-aware scoring:
+        - APPROACH: explicitly reward being *behind* the ball (relative to our base),
+          not just “near an approach point.”
+        - PUSH: reward straight progress to base and penalize being past the ball on the goal side.
+    • Smoothness costs: gentle penalties for curvature (|rv-lv|) and command jerk (Δwheel).
+    • Same clean egress + opening deconflict as before (odd bot waits a beat).
+
+    Opponent-agnostic; focuses on clean captures and smooth arcs.
+    """
+
+    # ---- Arena / base ----
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+
+    # ---- Opening & egress ----
+    OPENING_DELAY_TICKS = 18     # odd index waits ~0.075s (60 FPS * T_SCALE=4)
+    ENEMY_KEEP_OUT = 0.10
+    EGRESS_DIST = 0.40
+    EGRESS_TICKS = 44
+
+    # ---- Ball handling ----
+    APPROACH_OFFSET = 0.09
+    CAPTURE_R = 0.065
+    LOCK_TOL = 0.06
+
+    # ---- DWA (rollout) ----
+    DT = 1.0 / (60.0 * 4.0)      # sim timestep
+    HORIZON_STEPS_FAR = 18       # ~0.075s (when far from ball)
+    HORIZON_STEPS_NEAR = 12      # shorter horizon when near
+    WHEEL_BASE = 0.11            # ~robot width
+    VMAX_MPS = 0.9               # relative scaling for rollout (no need to be exact)
+
+    # Two-stage sampling
+    COARSE = (-1.0, 0.0, 1.0)    # 3x3 = 9 combos
+    REFINE_STEP = 0.35           # local grid around the coarse best: {-s,0,+s}^2 -> +9 combos
+
+    # ---- Scoring weights ----
+    W_DIST_TGT  = 0.8            # distance to chosen target
+    W_ALIGN     = 0.4            # heading alignment to target ray
+    W_FWD       = 0.8            # forward progress along initial ray (bigger = better)
+    W_BEHIND    = 1.0            # APPROACH: behind-ball reward (bigger dot = better -> enters as (1-dot))
+    W_AP_DIST   = 0.6            # APPROACH: distance to computed approach point
+    W_PAST_PEN  = 0.8            # PUSH: penalty if we’ve gone past the ball toward the base
+    W_WALL      = 0.8            # proximity to walls
+    W_MATE      = 1.0            # teammate proximity penalty
+    W_CURV      = 0.12           # |rv-lv| curvature penalty (reduces spin-in-place)
+    W_JERK      = 0.25           # command change penalty (Δwheel vs last output)
+    WALL_M      = 0.05
+
+    # ---- Controller smoothing ----
+    LPF_ALPHA = 0.7
+
+    # ---- Stuck recovery ----
+    HIST_N = 30
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS = 22
+
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._m = math
+        self._index = index
+        self._tick = 0
+        self._lock_kind = None  # 'red' or 'green'
+        self._lock_pos = None
+        self._egress_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+        self._u_prev = [0.0, 0.0]   # last issued wheels (for jerk + LPF)
+        self._u_seed = [0.0, 0.0]   # center of refine sampling
+
+    # ---------- tiny vec utils ----------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a);
+        return (0.0,0.0) if L==0 else (a[0]/L, a[1]/L)
+    def _perp(self,a): return (-a[1], a[0])
+    def _dot(self,a,b): return a[0]*b[0] + a[1]*b[1]
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp(self,x,lo,hi): return lo if x<lo else hi if x>hi else x
+    def _clamp_pt(self,p):
+        return (self._clamp(p[0], self.WALL_M, self.ARENA_W - self.WALL_M),
+                self._clamp(p[1], self.WALL_M, self.ARENA_H - self.WALL_M))
+
+    # ---------- bases ----------
+    def _own_base(self): return get_base_coords(self._index)
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0),(self.ARENA_W,0.0),(0.0,self.ARENA_H),(self.ARENA_W,self.ARENA_H)]
+        return max(corners, key=lambda c: self._dist(c,(bx,by)))
+    def _base_axes(self, corner):
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        return (ix,0.0),(0.0,iy)
+    def _base_rect(self, corner, margin=0.0):
+        ax, ay = self._base_axes(corner)
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+
+    # ---------- selection (SimpleBot-like, opponent-agnostic) ----------
+    def _simple_candidates(self, own_pos, own_base, greens, reds):
+        own_base_dist = self._dist(own_base, own_pos)
+        reds_ok   = [r for r in reds if self._dist(own_base, r) > own_base_dist]
+        greens_ok = [g for g in greens if self._dist(own_base, g) < own_base_dist]
+        reds_ok.sort(key=lambda p: self._dist(own_pos, p))
+        greens_ok.sort(key=lambda p: self._dist(own_pos, p))
+        if reds_ok:
+            return 'red', (reds_ok[0] if (self._index % 2 == 0) else reds_ok[min(1,len(reds_ok)-1)])
+        if greens_ok:
+            return 'green', (greens_ok[0] if (self._index % 2 == 0) else greens_ok[min(1,len(greens_ok)-1)])
+        if greens:
+            gs = sorted(greens, key=lambda p: self._dist(own_pos, p))
+            return 'green', gs[0]
+        return None, None
+
+    # ---------- target helpers ----------
+    def _approach_point(self, ball, goal_point):
+        to_goal = self._norm(self._sub(goal_point, ball))
+        if to_goal == (0.0,0.0): to_goal = (1.0,0.0)
+        ap = self._add(ball, self._mul(to_goal, -self.APPROACH_OFFSET))
+        return self._clamp_pt(ap), to_goal
+
+    def _keep_out_enemy_base(self, p, enemy_corner):
+        xmin, xmax, ymin, ymax = self._base_rect(enemy_corner, margin=self.ENEMY_KEEP_OUT)
+        if xmin <= p[0] <= xmax and ymin <= p[1] <= ymax:
+            center = self._base_center(enemy_corner)
+            out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+            p = self._add(center, self._mul(out, self.EGRESS_DIST*0.6))
+        return self._clamp_pt(p)
+
+    # ---------- rollout ----------
+    def _rollout(self, pose, lv, rv, steps):
+        x,y,th = pose
+        v_l = lv * self.VMAX_MPS
+        v_r = rv * self.VMAX_MPS
+        dt = self.DT
+        for _ in range(steps):
+            v = 0.5*(v_l + v_r)
+            w = (v_r - v_l) / max(1e-6, self.WHEEL_BASE)
+            th += w * dt
+            x  += v * self._m.cos(th) * dt
+            y  += v * self._m.sin(th) * dt
+            x = self._clamp(x, 0.0 + self.WALL_M, self.ARENA_W - self.WALL_M)
+            y = self._clamp(y, 0.0 + self.WALL_M, self.ARENA_H - self.WALL_M)
+        return (x,y,th)
+
+    # ---------- scoring (stage-aware) ----------
+    def _score(self, start_pose, lv, rv, steps, target, ray_dir, mate_pos,
+               stage, ball, goal_point, apoint):
+        # rollout end pose
+        x,y,th = self._rollout(start_pose, lv, rv, steps)
+        pos = (x,y)
+
+        # base terms
+        d_tgt = self._dist(pos, target)
+        align_err = abs((self._m.atan2(ray_dir[1], ray_dir[0]) - th + self._m.pi) % (2*self._m.pi) - self._m.pi)
+        progress = ( (x - start_pose[0]) * ray_dir[0] + (y - start_pose[1]) * ray_dir[1] )
+        wall_pen = min(x, self.ARENA_W-x, y, self.ARENA_H-y)
+        wall_pen = max(0.0, (self.WALL_M*1.5 - wall_pen)) / (self.WALL_M*1.5)
+
+        # teammate penalty
+        mate_pen = 0.0
+        if mate_pos is not None:
+            dm = self._dist(pos, mate_pos)
+            if dm < 0.18:
+                mate_pen = (0.18 - dm) / 0.18
+
+        # smoothness penalties
+        curv = abs(rv - lv)
+        jerk = abs(lv - self._u_prev[0]) + abs(rv - self._u_prev[1])
+
+        # stage-specific
+        stage_cost = 0.0
+        to_goal = self._norm(self._sub(goal_point, ball))
+        if stage == 'approach':
+            # be BEHIND the ball: vector from robot->ball should align with to_goal
+            rb = self._norm(self._sub(ball, pos))
+            behind_err = 1.0 - self._dot(rb, to_goal)  # 0 is perfect behind, 2 is worst
+            ap_dist = self._dist(pos, apoint)
+            stage_cost += self.W_BEHIND * behind_err + self.W_AP_DIST * ap_dist
+        else:  # 'push'
+            # being past the ball (between ball and base) is bad
+            # if (pos - ball) • to_goal > 0, we're on the goal side -> penalize
+            past = self._dot(self._sub(pos, ball), to_goal)
+            past_pen = max(0.0, past)
+            stage_cost += self.W_PAST_PEN * past_pen
+
+        # total (lower is better)
+        return ( self.W_DIST_TGT * d_tgt
+               + self.W_ALIGN    * align_err
+               - self.W_FWD      * progress
+               + self.W_WALL     * wall_pen
+               + self.W_MATE     * mate_pen
+               + self.W_CURV     * curv
+               + self.W_JERK     * jerk
+               + stage_cost )
+
+    # ---------- choose wheels via two-stage sampling ----------
+    def _pick_command(self, own_pos, own_dir, target, ray_dir, mate_pos,
+                      stage, ball, goal_point, apoint, near_ball):
+        pose = (own_pos[0], own_pos[1], own_dir)
+        steps = self.HORIZON_STEPS_NEAR if near_ball else self.HORIZON_STEPS_FAR
+
+        best = None
+
+        # 1) Coarse grid
+        for lv in self.COARSE:
+            for rv in self.COARSE:
+                sc = self._score(pose, lv, rv, steps, target, ray_dir, mate_pos, stage, ball, goal_point, apoint)
+                if (best is None) or (sc < best[0]):
+                    best = (sc, lv, rv)
+
+        # seed refine around the best coarse + last command
+        seed_l = 0.5*(best[1] + self._u_seed[0])
+        seed_r = 0.5*(best[2] + self._u_seed[1])
+
+        # 2) Local refine grid around seed
+        offs = (-self.REFINE_STEP, 0.0, self.REFINE_STEP)
+        for dl in offs:
+            for dr in offs:
+                lv = self._clamp(seed_l + dl, -1.0, 1.0)
+                rv = self._clamp(seed_r + dr, -1.0, 1.0)
+                sc = self._score(pose, lv, rv, steps, target, ray_dir, mate_pos, stage, ball, goal_point, apoint)
+                if sc < best[0]:
+                    best = (sc, lv, rv)
+
+        lv, rv = best[1], best[2]
+        self._u_seed = [lv, rv]  # remember refine center for next tick
+
+        # LPF + clamp
+        a = self.LPF_ALPHA
+        out = [a*self._u_prev[0] + (1-a)*lv,
+               a*self._u_prev[1] + (1-a)*rv]
+        out = [self._clamp(out[0], -1, 1), self._clamp(out[1], -1, 1)]
+        self._u_prev = out
+        return out
+
+    # ---------- stuck & egress ----------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0; prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp(-0.55 - 0.30*s, -1, 1), self._clamp(-0.55 + 0.30*s, -1, 1)]
+    def _start_egress_from(self, corner):
+        self._egress_ticks = self.EGRESS_TICKS
+        self._egress_from = corner
+    def _egress_target(self, corner):
+        center = self._base_center(corner)
+        out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+        tgt = self._add(center, self._mul(out, self.EGRESS_DIST))
+        return self._clamp_pt(tgt)
+
+    # ---------- idling ----------
+    def getWaitPosition(self):
+        return (0.48, 1.08) if self._index < 2 else (1.08, 0.48)
+
+    # ============================ MAIN ============================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        self._tick += 1
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        center = self._base_center(own_base)
+
+        # Opening deconflict
+        if (self._index % 2 == 1) and (self._tick <= self.OPENING_DELAY_TICKS):
+            return [0.0, 0.0]
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # EGRESS if inside any base
+        for corner, margin in [(own_base, 0.0), (enemy_base, self.ENEMY_KEEP_OUT)]:
+            xmin, xmax, ymin, ymax = self._base_rect(corner, margin)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                if self._egress_ticks == 0:
+                    self._start_egress_from(corner)
+                break
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+            mate_pos = bot_coords[mate][0] if 0 <= mate < len(bot_coords) else None
+            tgt = self._egress_target(self._egress_from)
+            ray = self._norm(self._sub(tgt, own_pos))
+            return self._pick_command(own_pos, own_dir, tgt, ray, mate_pos,
+                                      stage='push', ball=own_pos, goal_point=tgt,
+                                      apoint=tgt, near_ball=False)
+
+        # -------- Acquire/keep lock (SimpleBot-flavored) --------
+        kind, ball = self._simple_candidates(own_pos, own_base, green_coords, red_coords)
+        if self._lock_pos is None or self._lock_kind is None:
+            if ball is None:
+                mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+                mate_pos = bot_coords[mate][0] if 0 <= mate < len(bot_coords) else None
+                park = self.getWaitPosition()
+                ray = self._norm(self._sub(park, own_pos))
+                return self._pick_command(own_pos, own_dir, park, ray, mate_pos,
+                                          stage='push', ball=own_pos, goal_point=park,
+                                          apoint=park, near_ball=False)
+            self._lock_kind, self._lock_pos = kind, ball
+        else:
+            # refresh lock if same ball exists
+            balls = red_coords if self._lock_kind=='red' else green_coords
+            same = None
+            for b in balls:
+                if self._dist(b, self._lock_pos) <= self.LOCK_TOL:
+                    same = b; break
+            if same is not None:
+                self._lock_pos = same
+            elif ball is not None:
+                self._lock_kind, self._lock_pos = kind, ball
+            else:
+                self._lock_kind, self._lock_pos = None, None
+
+        # If no ball -> idle
+        if self._lock_pos is None:
+            mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+            mate_pos = bot_coords[mate][0] if 0 <= mate < len(bot_coords) else None
+            park = self.getWaitPosition()
+            ray = self._norm(self._sub(park, own_pos))
+            return self._pick_command(own_pos, own_dir, park, ray, mate_pos,
+                                      stage='push', ball=own_pos, goal_point=park,
+                                      apoint=park, near_ball=False)
+
+        # -------- Stage-aware target and scoring --------
+        goal_point = enemy_base if self._lock_kind == 'red' else center
+        apoint, to_goal = self._approach_point(self._lock_pos, goal_point)
+        apoint = self._keep_out_enemy_base(apoint, enemy_base)
+
+        near_ball = (self._dist(own_pos, self._lock_pos) <= self.CAPTURE_R)
+        if near_ball:
+            # PUSH stage: go straight toward base, but scoring penalizes being past the ball
+            target = goal_point
+            ray_dir = self._norm(self._sub(target, own_pos))
+            stage = 'push'
+        else:
+            # APPROACH stage: head to behind-ball region
+            target = apoint
+            ray_dir = self._norm(self._sub(target, own_pos))
+            stage = 'approach'
+
+        # DWA pick with local refine
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        mate_pos = bot_coords[mate][0] if 0 <= mate < len(bot_coords) else None
+        return self._pick_command(own_pos, own_dir, target, ray_dir, mate_pos,
+                                  stage=stage, ball=self._lock_pos, goal_point=goal_point,
+                                  apoint=apoint, near_ball=near_ball)
+@register_bot
+class FuzzyCollector:
+    """
+    Fuzzy-logic bot (opponent-agnostic).
+
+    What’s “fuzzy” here?
+      • It blends five angle-error sets and four distance sets to produce forward (v) and turn (w).
+      • A fuzzy “captured” gate (NearBall ∧ AlignedToGoal ∧ BehindBall) toggles PUSH vs APPROACH.
+      • Safety sets (NearWall, MateTooClose) damp speed and gently bias turning away from hazards.
+
+    Philosophy:
+      • Keep target selection simple (SimpleBot-flavored) but make the *low-level motion* smart and smooth.
+      • Avoid wiggle: rotate-in-place when badly misaligned; low-pass wheels; jerk & curvature naturally limited.
+    """
+
+    # --- Arena / base ---
+    ARENA_W = 1.5
+    ARENA_H = 1.5
+    BASE_SIZE = 0.4
+
+    # --- Egress ---
+    ENEMY_KEEP_OUT = 0.10
+    EGRESS_DIST = 0.40
+    EGRESS_TICKS = 44
+
+    # --- Ball handling / gating ---
+    APPROACH_OFFSET = 0.090    # behind-ball standoff (m)
+    CAPTURE_R = 0.065          # close enough to count as contact (m)
+    ENTER_PUSH = 0.62          # fuzzy captured degree to enter push
+    EXIT_PUSH  = 0.28          # hysteresis to leave push
+
+    # --- Controller / smoothing ---
+    ALIGN_TURN_ONLY = 82.0     # deg; if worse -> no forward
+    LPF_ALPHA = 0.72           # wheel low-pass
+    WALL_M = 0.05              # hazard margin to walls
+
+    # --- Stuck recovery ---
+    HIST_N = 30
+    STUCK_STEP_MIN = 0.0035
+    ESCAPE_TICKS = 22
+
+    # --- Teammate separation ---
+    SEP_RADIUS = 0.18
+    SEP_GAIN   = 0.08
+
+    def __init__(self, index):
+        import math
+        from collections import deque
+        self._m = math
+        self._index = index
+        self._push_mode = False
+        self._lock_kind = None   # 'red' or 'green'
+        self._lock_pos  = None
+        self._egress_ticks = 0
+        self._escape = 0
+        self._hist = deque(maxlen=self.HIST_N)
+        self._u_prev = [0.0, 0.0]
+
+    # ------------------ tiny vec utils ------------------
+    def _add(self,a,b): return (a[0]+b[0], a[1]+b[1])
+    def _sub(self,a,b): return (a[0]-b[0], a[1]-b[1])
+    def _mul(self,a,s): return (a[0]*s, a[1]*s)
+    def _len(self,a): return self._m.hypot(a[0], a[1])
+    def _norm(self,a):
+        L = self._len(a); 
+        return (0.0,0.0) if L == 0 else (a[0]/L, a[1]/L)
+    def _perp(self,a): return (-a[1], a[0])
+    def _dot(self,a,b): return a[0]*b[0] + a[1]*b[1]
+    def _dist(self,a,b): return self._len(self._sub(a,b))
+    def _clamp(self,x,lo,hi): return lo if x<lo else hi if x>hi else x
+    def _clamp_pt(self,p):
+        return (self._clamp(p[0], self.WALL_M, self.ARENA_W - self.WALL_M),
+                self._clamp(p[1], self.WALL_M, self.ARENA_H - self.WALL_M))
+
+    # ------------------ bases ------------------
+    def _own_base(self): return get_base_coords(self._index)
+    def _enemy_base(self):
+        bx, by = self._own_base()
+        corners = [(0.0,0.0),(self.ARENA_W,0.0),(0.0,self.ARENA_H),(self.ARENA_W,self.ARENA_H)]
+        return max(corners, key=lambda c: self._dist(c, (bx,by)))
+    def _base_axes(self, corner):
+        cx, cy = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+        ix = 1.0 if corner[0] < cx else -1.0
+        iy = 1.0 if corner[1] < cy else -1.0
+        return (ix,0.0),(0.0,iy)
+    def _base_center(self, corner):
+        ax, ay = self._base_axes(corner)
+        return self._add(self._add(corner, self._mul(ax, self.BASE_SIZE*0.5)), self._mul(ay, self.BASE_SIZE*0.5))
+    def _base_rect(self, corner, margin=0.0):
+        ax, ay = self._base_axes(corner)
+        far = self._add(self._add(corner, self._mul(ax, self.BASE_SIZE)), self._mul(ay, self.BASE_SIZE))
+        xmin, xmax = sorted([corner[0], far[0]])
+        ymin, ymax = sorted([corner[1], far[1]])
+        return (xmin - margin, xmax + margin, ymin - margin, ymax + margin)
+
+    # ------------------ membership helpers ------------------
+    def _tri(self, x, a, b, c):  # triangular
+        if x <= a or x >= c: return 0.0
+        if x == b: return 1.0
+        if x < b:  return (x - a) / max(1e-9, (b - a))
+        return (c - x) / max(1e-9, (c - b))
+    def _trap(self, x, a, b, c, d):  # trapezoidal
+        if x <= a or x >= d: return 0.0
+        if b <= x <= c: return 1.0
+        if a < x < b: return (x - a) / max(1e-9, (b - a))
+        return (d - x) / max(1e-9, (d - c))
+
+    # ------------------ target construction ------------------
+    def _approach_point(self, ball, goal_point):
+        to_goal = self._norm(self._sub(goal_point, ball))
+        if to_goal == (0.0,0.0): to_goal = (1.0,0.0)
+        ap = self._add(ball, self._mul(to_goal, -self.APPROACH_OFFSET))
+        return self._clamp_pt(ap), to_goal
+
+    def _keep_out_enemy_base(self, p, enemy_corner):
+        xmin, xmax, ymin, ymax = self._base_rect(enemy_corner, margin=self.ENEMY_KEEP_OUT)
+        if xmin <= p[0] <= xmax and ymin <= p[1] <= ymax:
+            center = self._base_center(enemy_corner)
+            out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+            p = self._add(center, self._mul(out, self.EGRESS_DIST*0.6))
+        return self._clamp_pt(p)
+
+    # ------------------ fuzzy gating for PUSH ------------------
+    def _captured_degree(self, own_pos, own_dir, ball, goal_point):
+        # NearBall
+        db = self._dist(own_pos, ball)
+        near = self._trap(db, 0.0, 0.0, 0.06, 0.10)
+        # AlignedToGoal (heading ~ ball->goal)
+        to_goal = self._norm(self._sub(goal_point, ball))
+        ang = self._m.atan2(to_goal[1], to_goal[0])
+        err_deg = abs((ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi) * 180.0 / self._m.pi
+        aligned = self._trap(err_deg, 0.0, 0.0, 10.0, 15.0)
+        # BehindBall (robot is behind the ball w.r.t goal)
+        rb = self._norm(self._sub(own_pos, ball))
+        dot = self._dot(rb, to_goal)            # >0 means in FRONT; <0 behind
+        behind_score = self._clamp(-dot, -1.0, 1.0)  # map: 1 = perfect behind, -1 = far front
+        behind = self._trap(behind_score, 0.2, 0.5, 1.0, 1.0)
+        return min(near, aligned, behind)
+
+    # ------------------ fuzzy controller (v,w) ------------------
+    def _fuzzy_drive(self, own_pos, own_dir, target, context):
+        """
+        context: dict with optional keys:
+          - 'ball': pos
+          - 'goal': pos
+          - 'ap': approach point
+          - 'push': bool
+          - 'mate_pos': pos or None
+        """
+        # 1) Angle error sets
+        tdx, tdy = target[0]-own_pos[0], target[1]-own_pos[1]
+        if tdx == 0.0 and tdy == 0.0:
+            return [0.0, 0.0]
+        tgt_ang = self._m.atan2(tdy, tdx)
+        err = (tgt_ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+        err_deg = err * 180.0 / self._m.pi
+
+        mu_NL = self._tri(err_deg, -180.0, -90.0, -30.0)
+        mu_NS = self._tri(err_deg, -60.0,  -20.0,  0.0)
+        mu_ZE = self._tri(err_deg, -10.0,   0.0,  10.0)
+        mu_PS = self._tri(err_deg,  0.0,    20.0, 60.0)
+        mu_PL = self._tri(err_deg,  30.0,   90.0, 180.0)
+
+        # 2) Distance sets (to target)
+        dt = self._dist(own_pos, target)
+        mu_VC = self._trap(dt, 0.00, 0.00, 0.06, 0.10)
+        mu_C  = self._tri (dt, 0.06, 0.16, 0.28)
+        mu_M  = self._tri (dt, 0.18, 0.35, 0.55)
+        mu_F  = self._trap(dt, 0.40, 0.60, 1.50, 1.50)
+
+        # 3) Safety sets
+        # Wall proximity
+        x, y = own_pos
+        wall_d = min(x, self.ARENA_W-x, y, self.ARENA_H-y)
+        mu_WALL = self._trap(self.WALL_M*1.5 - wall_d, 0.0, 0.0, self.WALL_M*0.5, self.WALL_M*1.5)
+        # Mate distance
+        mu_MATE = 0.0
+        mate_pos = context.get('mate_pos', None)
+        if mate_pos is not None:
+            dm = self._dist(own_pos, mate_pos)
+            mu_MATE = self._trap(self.SEP_RADIUS - dm, 0.0, 0.0, 0.05, self.SEP_RADIUS)
+
+        # 4) Angle singleton map for w (turn)
+        #    Weighted average gives a smooth normalized turn in [-1,1].
+        w_singletons = [ -1.0, -0.5, 0.0, 0.5, 1.0 ]
+        w_mus = [mu_NL, mu_NS, mu_ZE, mu_PS, mu_PL]
+        w_num = sum(m*s for m,s in zip(w_mus, w_singletons))
+        w_den = max(1e-6, sum(w_mus))
+        w_base = w_num / w_den
+
+        # 5) v from angle & distance preferences
+        v_angle_vals = [0.20, 0.55, 1.00, 0.55, 0.20]
+        v_angle = sum(m*v for m,v in zip(w_mus, v_angle_vals)) / w_den
+        v_dist_vals  = [0.25, 0.55, 0.85, 1.00]
+        v_dist_den   = max(1e-6, (mu_VC + mu_C + mu_M + mu_F))
+        v_dist = (mu_VC*v_dist_vals[0] + mu_C*v_dist_vals[1] +
+                  mu_M*v_dist_vals[2] + mu_F*v_dist_vals[3]) / v_dist_den
+        v = 0.5*(v_angle + v_dist)
+
+        # 6) Stage-specific tweaks (APPROACH vs PUSH)
+        push = context.get('push', False)
+        ball = context.get('ball', own_pos)
+        goal = context.get('goal', target)
+        ap   = context.get('ap', target)
+
+        # Encourage being *behind* ball in APPROACH
+        to_goal = self._norm(self._sub(goal, ball))
+        rb = self._norm(self._sub(own_pos, ball))
+        behind_score = self._clamp(-self._dot(rb, to_goal), -1.0, 1.0)  # 1 = perfectly behind
+        mu_BEHIND = self._trap(behind_score, 0.2, 0.5, 1.0, 1.0)
+        if not push:
+            # If not behind, slow down a little and turn more decisively
+            v *= (0.85 + 0.15 * mu_BEHIND)
+            # Nudge turn toward the approach point bearing (helps swing around)
+            ap_ang = self._m.atan2(ap[1]-own_pos[1], ap[0]-own_pos[0])
+            ap_err = (ap_ang - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+            ap_err_deg = ap_err * 180.0 / self._m.pi
+            # small blend toward the approach error
+            ap_mu = self._tri(ap_err_deg, -10.0, 0.0, 10.0)
+            w_base = (1.0 - 0.35*ap_mu) * w_base + 0.35*ap_mu * (ap_err/ self._m.radians(82.0))
+        else:
+            # In push: prefer straighter, faster drive
+            v = min(1.0, v * 1.05)
+            w_base *= 0.85
+
+        # 7) Safety modulation
+        v *= (1.0 - 0.50*max(0.0, mu_WALL)) * (1.0 - 0.45*max(0.0, mu_MATE))
+        # Bias turn away from walls: point a bit toward arena center when near wall
+        if mu_WALL > 0.0:
+            cen = (self.ARENA_W*0.5, self.ARENA_H*0.5)
+            err_c = (self._m.atan2(cen[1]-own_pos[1], cen[0]-own_pos[0]) - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+            w_base = 0.75*w_base + 0.25*mu_WALL * self._clamp(err_c / self._m.radians(82.0), -1.0, 1.0)
+        # Bias turn away from mate if too close
+        if mu_MATE > 0.0 and mate_pos is not None:
+            away = self._m.atan2(own_pos[1]-mate_pos[1], own_pos[0]-mate_pos[0])
+            err_a = (away - own_dir + self._m.pi) % (2*self._m.pi) - self._m.pi
+            w_base = 0.8*w_base + 0.2*mu_MATE * self._clamp(err_a / self._m.radians(82.0), -1.0, 1.0)
+
+        # 8) Rotate-in-place gate for very large errors
+        if abs(err_deg) > self.ALIGN_TURN_ONLY:
+            v *= 0.0
+
+        # 9) Convert (v,w) -> wheels and low-pass
+        l, r = v - w_base, v + w_base
+        mag = max(1.0, abs(l), abs(r))
+        l, r = l/mag, r/mag
+        a = self.LPF_ALPHA
+        out = [a*self._u_prev[0] + (1-a)*l, a*self._u_prev[1] + (1-a)*r]
+        out = [self._clamp(out[0], -1.0, 1.0), self._clamp(out[1], -1.0, 1.0)]
+        self._u_prev = out
+        return out
+
+    # ------------------ selection (SimpleBot-flavored) ------------------
+    def _simple_candidates(self, own_pos, own_base, greens, reds):
+        own_base_dist = self._dist(own_base, own_pos)
+        reds_ok   = [r for r in reds if self._dist(own_base, r) > own_base_dist]
+        greens_ok = [g for g in greens if self._dist(own_base, g) < own_base_dist]
+        reds_ok.sort(key=lambda p: self._dist(own_pos, p))
+        greens_ok.sort(key=lambda p: self._dist(own_pos, p))
+        if reds_ok:
+            return 'red', (reds_ok[0] if (self._index % 2 == 0) else reds_ok[min(1, len(reds_ok)-1)])
+        if greens_ok:
+            return 'green', (greens_ok[0] if (self._index % 2 == 0) else greens_ok[min(1, len(greens_ok)-1)])
+        if greens:
+            gs = sorted(greens, key=lambda p: self._dist(own_pos, p))
+            return 'green', gs[0]
+        return None, None
+
+    # ------------------ stuck / egress / nudge ------------------
+    def _update_hist_and_check_stuck(self, own_pos):
+        self._hist.append(own_pos)
+        if len(self._hist) < self._hist.maxlen: return False
+        dist = 0.0; prev = None
+        for p in self._hist:
+            if prev is not None: dist += self._dist(p, prev)
+            prev = p
+        return (dist / (len(self._hist)-1)) < self.STUCK_STEP_MIN
+    def _escape_controls(self):
+        s = -1.0 if (self._index % 2 == 0) else 1.0
+        return [self._clamp(-0.55 - 0.30*s, -1, 1), self._clamp(-0.55 + 0.30*s, -1, 1)]
+    def _start_egress_from(self, corner):
+        self._egress_ticks = self.EGRESS_TICKS
+        self._egress_from = corner
+    def _egress_target(self, corner):
+        center = self._base_center(corner)
+        out = self._norm(self._sub((self.ARENA_W*0.5, self.ARENA_H*0.5), center))
+        tgt = self._add(center, self._mul(out, self.EGRESS_DIST))
+        return self._clamp_pt(tgt)
+    def _nudge(self, own_pos, bot_coords):
+        n = (0.0,0.0)
+        mate = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        if 0 <= mate < len(bot_coords):
+            mate_pos, _ = bot_coords[mate]
+            d = self._dist(own_pos, mate_pos)
+            if 1e-6 < d < self.SEP_RADIUS:
+                away = self._norm(self._sub(own_pos, mate_pos))
+                n = self._add(n, self._mul(away, self.SEP_GAIN * (self.SEP_RADIUS - d)/self.SEP_RADIUS))
+        # soft wall push
+        x,y = own_pos
+        if x < self.WALL_M: n = self._add(n, ( self.SEP_GAIN*(self.WALL_M-x)/self.WALL_M, 0.0))
+        if self.ARENA_W - x < self.WALL_M: n = self._add(n, (-self.SEP_GAIN*(self.WALL_M-(self.ARENA_W-x))/self.WALL_M, 0.0))
+        if y < self.WALL_M: n = self._add(n, (0.0,  self.SEP_GAIN*(self.WALL_M-y)/self.WALL_M))
+        if self.ARENA_H - y < self.WALL_M: n = self._add(n, (0.0, -self.SEP_GAIN*(self.WALL_M-(self.ARENA_H-y))/self.WALL_M))
+        return n
+
+    # ------------------ idling ------------------
+    def getWaitPosition(self):
+        return (0.48, 1.08) if self._index < 2 else (1.08, 0.48)
+
+    # ============================ MAIN ============================
+    def get_controls(self, bot_coords, green_coords, red_coords):
+        own_pos, own_dir = bot_coords[self._index]
+        own_base = self._own_base()
+        enemy_base = self._enemy_base()
+        center = self._base_center(own_base)
+
+        # ESCAPE if stuck
+        if self._escape > 0:
+            self._escape -= 1
+            self._hist.clear()
+            return self._escape_controls()
+        if self._update_hist_and_check_stuck(own_pos):
+            self._escape = self.ESCAPE_TICKS
+            return self._escape_controls()
+
+        # EGRESS if inside any base
+        for corner, margin in [(own_base, 0.0), (enemy_base, self.ENEMY_KEEP_OUT)]:
+            xmin, xmax, ymin, ymax = self._base_rect(corner, margin)
+            if xmin <= own_pos[0] <= xmax and ymin <= own_pos[1] <= ymax:
+                if self._egress_ticks == 0:
+                    self._start_egress_from(corner)
+                break
+        if self._egress_ticks > 0:
+            self._egress_ticks -= 1
+            tgt = self._add(self._egress_target(self._egress_from), self._nudge(own_pos, bot_coords))
+            return self._fuzzy_drive(own_pos, own_dir, tgt, {'push': True, 'mate_pos': bot_coords[(self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))][0] if len(bot_coords)>1 else None})
+
+        # --- Select a ball (SimpleBot-flavored, teammate split) ---
+        kind, ball = self._simple_candidates(own_pos, own_base, green_coords, red_coords)
+        if self._lock_pos is None or self._lock_kind is None:
+            if ball is None:
+                park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+                return self._fuzzy_drive(own_pos, own_dir, park, {'push': False, 'mate_pos': bot_coords[(self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))][0] if len(bot_coords)>1 else None})
+            self._lock_kind, self._lock_pos = kind, ball
+        else:
+            # Keep same ball if still present
+            balls = red_coords if self._lock_kind=='red' else green_coords
+            same = None
+            for b in balls:
+                if self._dist(b, self._lock_pos) <= 0.06:
+                    same = b; break
+            if same is not None:
+                self._lock_pos = same
+            elif ball is not None:
+                self._lock_kind, self._lock_pos = kind, ball
+            else:
+                self._lock_kind, self._lock_pos = None, None
+
+        if self._lock_pos is None:
+            park = self._add(self.getWaitPosition(), self._nudge(own_pos, bot_coords))
+            return self._fuzzy_drive(own_pos, own_dir, park, {'push': False, 'mate_pos': bot_coords[(self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))][0] if len(bot_coords)>1 else None})
+
+        # --- Build targets, compute fuzzy captured degree, manage push state ---
+        goal_point = enemy_base if self._lock_kind == 'red' else center
+        ap, to_goal = self._approach_point(self._lock_pos, goal_point)
+        ap = self._keep_out_enemy_base(ap, enemy_base)
+
+        cap = self._captured_degree(own_pos, own_dir, self._lock_pos, goal_point)
+        if not self._push_mode and cap >= self.ENTER_PUSH:
+            self._push_mode = True
+        elif self._push_mode and cap <= self.EXIT_PUSH:
+            self._push_mode = False
+
+        # If pushing and we’re inside our base, trigger egress
+        xmin, xmax, ymin, ymax = self._base_rect(own_base, 0.0)
+        if self._push_mode and (xmin <= own_pos[0] <= xmax) and (ymin <= own_pos[1] <= ymax):
+            if self._egress_ticks == 0:
+                self._start_egress_from(own_base)
+
+        # --- Final target & fuzzy drive ---
+        target = goal_point if self._push_mode else ap
+        target = self._add(target, self._nudge(own_pos, bot_coords))
+        mate_idx = (self._index ^ 1) if (self._index < 2) else (2 + ((self._index - 2) ^ 1))
+        mate_pos = bot_coords[mate_idx][0] if 0 <= mate_idx < len(bot_coords) else None
+        return self._fuzzy_drive(
+            own_pos, own_dir, target,
+            {'push': self._push_mode, 'ball': self._lock_pos, 'goal': goal_point, 'ap': ap, 'mate_pos': mate_pos}
+        )
+
