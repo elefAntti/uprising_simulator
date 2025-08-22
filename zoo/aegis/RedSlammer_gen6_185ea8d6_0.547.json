@@ -1,0 +1,24 @@
+{
+  "candidate": "RedSlammer",
+  "gen": 6,
+  "score": 0.5465686274509803,
+  "datetime_utc": "20250818T152728Z",
+  "genome": {
+    "approach_offset": 0.12631672717653222,
+    "capture_r": 0.07340131887784843,
+    "threat_r": 0.30669907914212424,
+    "lock_margin": 0.1497152044041734,
+    "lock_tol": 0.060482205891677264,
+    "sep_radius": 0.18862299620357204,
+    "sep_gain": 0.13187335588447874,
+    "wall_margin": 0.08581483304617422,
+    "hist_n": 41,
+    "stuck_step_min": 0.007235662401173836,
+    "escape_ticks": 22,
+    "max_speed": 0.9793890796940207,
+    "turn_gain": 2.4772245840731224,
+    "slow_angle_deg": 40
+  },
+  "class": "RedSlammer",
+  "name": "RedSlammer@gen6_185ea8d6"
+}

@@ -1,0 +1,14 @@
+{
+  "candidate": "FuzzyPusher",
+  "gen": 20,
+  "score": 0.5178571428571429,
+  "datetime_utc": "20250819T033247Z",
+  "genome": {
+    "w_max": 3.8422280150816728,
+    "v_max": 0.7850611381144533,
+    "commit_time": 0.7943961155491206,
+    "switch_threshold": 0.1267429643356422
+  },
+  "class": "FuzzyPusher",
+  "name": "FuzzyPusher@gen20_41ba5e62"
+}
