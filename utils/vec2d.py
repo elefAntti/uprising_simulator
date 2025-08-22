@@ -15,6 +15,9 @@ def vec_dot(a,b):
 def vec_len(a):
     return math.sqrt(a[0]*a[0] + a[1]*a[1])
 
+def vec_norm(a):
+    return vec_len(a)
+
 def vec_normalize(a):
     return vec_mul(a, 1.0/vec_len(a))
 
