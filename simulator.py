@@ -243,10 +243,13 @@ class Simulator:
         if self.scores[0] < self.scores[1]:
             return 2
         return 0
-    
+    def get_red_cores(self):
+    	return [bvec_to_tuple(core.position) for core in self.red_cores]    
+    def get_green_cores(self):
+    	return [bvec_to_tuple(core.position) for core in self.green_cores]   
     def steer_robots(self):
-        red_coords=[bvec_to_tuple(core.position) for core in self.red_cores]
-        green_coords=[bvec_to_tuple(core.position) for core in self.green_cores]
+        red_coords=self.get_red_cores()
+        green_coords=self.get_green_cores()
         bot_coords=[(bvec_to_tuple(bot.position), bot.angle) for bot in self.robots]
         for robot, controller in zip(self.robots, self.controllers):
             left_vel, right_vel = controller.get_controls(bot_coords, green_coords, red_coords)
