@@ -13,10 +13,7 @@ except Exception:
 
 from simulator import Simulator
 from bots import load_all_bots, get_bot_registry
-try:
-    import bots.aegis_zoo  # noqa: F401
-except Exception:
-    pass
+import bots.param_alias as PA
 
 from utils.param_spec import get_param_spec_for_class, params_to_vec01, vec01_to_params, spec_keys
 
@@ -269,6 +266,7 @@ def main():
     args = ap.parse_args()
 
     load_all_bots()
+    PA.autoload("zoo/**/*.json")
     REG = get_bot_registry()
     if args.candidate not in REG:
         raise SystemExit(f"Unknown candidate: {args.candidate}. Available: {', '.join(sorted(REG.keys()))}")

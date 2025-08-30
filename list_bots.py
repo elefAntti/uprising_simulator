@@ -7,4 +7,4 @@ PA.autoload("zoo/**/*.json")
 
 REG = get_bot_registry()
 
-print("\n".join(REG.keys()))
+print("\n".join(sorted(REG.keys())))
