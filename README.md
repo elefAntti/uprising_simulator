@@ -191,7 +191,121 @@ Outputs: **`best_params.json`**, optional Zoo JSONs per iteration.
 - Start with modest evaluation budgets (games per opponent) and increase when refining.
 
 ---
+## Behavior cloning
 
+* `--resume <checkpoint.pth>`
+  Full resume (model + optimizer + scheduler + AMP scaler + normalizer + epoch counter).
+* `--init-weights <weights.pth>`
+  Load **just the model weights** from a checkpoint or raw state dict, then start a **fresh run** (new optimizer/schedule).
+
+  * Works with dicts containing keys like `model`, `model_state`, or a raw state\_dict.
+  * Optional: `--init-use-norm` will also load `normalizer_mean/std` from the checkpoint if present.
+  * Optional: `--init-strict` to enforce exact key match (defaults to non-strict).
+
+> If you pass both `--resume` and `--init-weights`, `--resume` wins and `--init-weights` is ignored.
+
+### Examples
+
+**1) Resume a previous run (exact continuation):**
+
+```bash
+python train_distill_init_from_pth.py \
+  --npz-glob "logs_npz/*.npz" \
+  --out runs/bc_run \
+  --resume runs/bc_run/checkpoint.pth \
+  --workers 4 --batch-size 1024
+```
+
+**2) Start a new run but initialize from existing weights:**
+
+```bash
+python train_distill_init_from_pth.py \
+  --npz-glob "logs_npz/*.npz" \
+  --out runs/bc_finetune \
+  --init-weights pretrained/bc_policy_200.pth \
+  --init-use-norm \
+  --epochs 20 --batch-size 1024 --workers 4
+```
+
+**3) Initialize non-strictly (ignore a few missing/extra keys) and keep our cached normalization:**
+
+```bash
+python train_distill_init_from_pth.py \
+  --npz-glob "/content/logs_npz_local/*.npz" \
+  --out runs/bc_adapt \
+  --init-weights external/model.pth \
+  --init-strict false \
+  --epochs 10 --batch-size 2048 --workers 4
+```
+
+## DAgger
+
+After behavior cloning logs, it might be useful to let the student control the bot part of the time and the teacher log what it would have done in those situations. For these purposes there is the following script:
+
+No problem—you’ve got a few solid paths even if you trained with a different script and don’t have normalization stats.
+
+## Option A — Rebuild mean/std quickly from your NPZ logs
+
+Use this tiny helper to compute and cache `norm_stats` from your existing shards (fast, scans a subset):
+
+
+```bash
+python compute_norm_from_npz.py --glob "logs_npz/*.npz" --out runs/stats --batches 100 --batch-size 2048
+# Produces: runs/stats/norm_stats.npz and norm_stats.json
+```
+
+Then run DAgger with your plain `.pth`:
+
+```bash
+python log_dagger.py --episodes 200 \
+  --teachers AegisPilot@AegisPilot_gen15_afb0c584_0.777 \
+  --student-frac 0.3 \
+  --student-script bc_policy_200.pth \
+  --student-mean-std runs/stats/norm_stats.npz \
+  --out logs_dagger_npz
+```
+
+## Option B — Skip normalization (if your model expects raw inputs)
+
+I patched DAgger to support a **no-normalize** mode and to **infer input\_dim from the checkpoint** automatically:
+
+* **[log\_dagger.py](sandbox:/mnt/data/log_dagger.py)** (also bundled: [dagger\_no\_stats\_bundle.zip](sandbox:/mnt/data/dagger_no_stats_bundle.zip))
+
+Run:
+
+```bash
+python log_dagger.py --episodes 200 \
+  --teachers AegisPilot@AegisPilot_gen15_afb0c584_0.777 \
+  --student-frac 0.3 \
+  --student-script bc_policy_200.pth \
+  --student-no-norm \
+  --out logs_dagger_npz
+```
+
+Notes:
+
+* The loader will try TorchScript first.
+* If it’s a raw state\_dict, it will **infer** `input_dim` from the first Linear layer’s weight shape.
+* You can override the architecture if needed:
+
+  ```
+  --student-hidden "512,256,128" --student-dropout 0.05
+  ```
+
+## Option C — Our resume checkpoint (if available)
+
+If you have a `checkpoint.pth` saved by my patched trainer, it already includes `normalizer_mean/std` and `args`, so DAgger will reconstruct everything automatically:
+
+```bash
+python log_dagger.py --episodes 200 \
+  --teachers AegisPilot@AegisPilot_gen15_afb0c584_0.777 \
+  --student-frac 0.3 \
+  --student-script runs/bc_policy/checkpoint.pth \
+  --out logs_dagger_npz
+```
+
+
+---
 ## License
 
 See repository license.
