@@ -22,13 +22,12 @@ class BCNet(nn.Module):
     def forward(self, x):
         return self.network(x)
 
-@register_bot
-class ClonedBot:
-    def __init__(self, agent_idx):
+class _NNBase:
+    def __init__(self, agent_idx, model_file):
         self.idx = agent_idx
         self.builder = EgoObsBuilder() # Use the same obs builder
         self.model = BCNet()
-        self.model.load_state_dict(torch.load("bc_policy.pth"))
+        self.model.load_state_dict(torch.load(model_file))
         self.model.eval() # Set model to evaluation mode
         
     def _bases(self):
@@ -51,32 +50,18 @@ class ClonedBot:
         actions = action_tensor.squeeze().cpu().numpy()
         return actions[0], actions[1]
 
+@register_bot
+class ClonedBot(_NNBase):
+    def __init__(self, agent_idx):
+        super().__init__(agent_idx, "bc_policy.pth")
 
 @register_bot
-class RLBot:
+class Dagger(_NNBase):
     def __init__(self, agent_idx):
-        self.idx = agent_idx
-        self.builder = EgoObsBuilder() # Use the same obs builder
-        self.model = BCNet()
-        self.model.load_state_dict(torch.load("rl_policy.pth"))
-        self.model.eval() # Set model to evaluation mode
-        
-    def _bases(self):
-        base_own=get_base_coords(self.idx)
-        base_opp=get_base_coords(get_opponent_index(self.idx))
-        return base_own, base_opp
+        super().__init__(agent_idx, "dagger_policy.pth")
 
+@register_bot
+class RLBot(_NNBase):
+    def __init__(self, agent_idx):
+        super().__init__(agent_idx, "rl_policy.pth")
 
-    def get_controls(self, bot_coords, green_coords, red_coords):
-        # NOTE: You'll need to figure out base_own and base_opp
-        # This is available in log_distill.py's wrapper
-        base_own, base_opp = self._bases()
-
-        obs_dict = self.builder.build(self.idx, bot_coords, red_coords, green_coords, base_own, base_opp)
-        obs_tensor = torch.from_numpy(obs_dict["flat"]).float().unsqueeze(0) # Add batch dimension
-
-        with torch.no_grad():
-            action_tensor = self.model(obs_tensor)
-
-        actions = action_tensor.squeeze().cpu().numpy()
-        return actions[0], actions[1]
