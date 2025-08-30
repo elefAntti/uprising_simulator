@@ -1,5 +1,4 @@
-# This is the GEMINI generated PoC training script
-# train_bc.py
+# train_bc.py 
 
 import torch
 import torch.nn as nn
@@ -7,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 import os
 from tqdm import tqdm
+import argparse # New import for command-line arguments
 
 # --- 1. The Neural Network ---
 # A simple Multi-Layer Perceptron (MLP).
@@ -30,9 +30,7 @@ class BCNet(nn.Module):
 class DistillDataset(Dataset):
     def __init__(self, data_dir):
         self.data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.npz')]
-        
-        # Load all data into memory for this proof-of-concept
-        # For larger datasets, you might load files on-demand
+
         all_obs = []
         all_actions = []
         print(f"Loading data from {len(self.data_files)} files...")
@@ -40,7 +38,7 @@ class DistillDataset(Dataset):
             with np.load(file_path) as data:
                 all_obs.append(data['obs'])
                 all_actions.append(data['action'])
-        
+
         self.observations = np.concatenate(all_obs, axis=0)
         self.actions = np.concatenate(all_actions, axis=0)
         print(f"Loaded {len(self.observations)} total steps.")
@@ -55,9 +53,17 @@ class DistillDataset(Dataset):
 
 # --- 3. The Main Training Loop ---
 if __name__ == "__main__":
+    # --- New: Setup command-line argument parsing ---
+    parser = argparse.ArgumentParser(description="Train a Behavior Cloning policy for the robot game.")
+    parser.add_argument("--output-file", "-o", type=str, default="bc_policy.pth",
+                        help="Path to save the trained model file.")
+    parser.add_argument("--input-file", "-i", type=str, default=None,
+                        help="Optional path to a pre-trained model to continue training from.")
+    args = parser.parse_args()
+
     # Hyperparameters
-    DATA_DIR = "logs_npz"
-    EPOCHS = 200
+    DATA_DIR = "logs_npz" # Assuming data is in this directory
+    EPOCHS = 100
     BATCH_SIZE = 64
     LEARNING_RATE = 1e-4
     VAL_SPLIT = 0.1 # Use 10% of data for validation
@@ -68,7 +74,7 @@ if __name__ == "__main__":
 
     # Load dataset
     dataset = DistillDataset(DATA_DIR)
-    
+
     # Split into training and validation sets
     val_size = int(len(dataset) * VAL_SPLIT)
     train_size = len(dataset) - val_size
@@ -77,48 +83,47 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
 
-    # Initialize model, loss function, and optimizer
+    # Initialize model
     model = BCNet().to(device)
-    loss_fn = nn.MSELoss() # Mean Squared Error is great for regression problems like this
+
+    # --- New: Load weights from input file if provided ---
+    if args.input_file:
+        if os.path.exists(args.input_file):
+            print(f"Loading model weights from '{args.input_file}' to continue training.")
+            model.load_state_dict(torch.load(args.input_file, map_location=device))
+        else:
+            print(f"Warning: Input file '{args.input_file}' not found. Starting with a new model.")
+
+    # Initialize loss function and optimizer
+    loss_fn = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     # Training loop
     for epoch in range(EPOCHS):
-        # Training phase
         model.train()
         train_loss = 0.0
         for obs_batch, act_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Training]"):
-            obs_batch = obs_batch.to(device)
-            act_batch = act_batch.to(device)
-
-            # Forward pass
+            obs_batch, act_batch = obs_batch.to(device), act_batch.to(device)
             pred_actions = model(obs_batch)
             loss = loss_fn(pred_actions, act_batch)
-
-            # Backward pass and optimization
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
             train_loss += loss.item()
 
-        # Validation phase
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for obs_batch, act_batch in val_loader:
-                obs_batch = obs_batch.to(device)
-                act_batch = act_batch.to(device)
+                obs_batch, act_batch = obs_batch.to(device), act_batch.to(device)
                 pred_actions = model(obs_batch)
                 loss = loss_fn(pred_actions, act_batch)
                 val_loss += loss.item()
 
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
-        
         print(f"Epoch {epoch+1}/{EPOCHS} -> Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
 
-    # Save the trained model
-    MODEL_PATH = "bc_policy.pth"
-    torch.save(model.state_dict(), MODEL_PATH)
-    print(f"\nTraining complete! Model saved to {MODEL_PATH}")
+    # --- Modified: Save the trained model to the specified output file ---
+    torch.save(model.state_dict(), args.output_file)
+    print(f"\nTraining complete! Model saved to '{args.output_file}'")
