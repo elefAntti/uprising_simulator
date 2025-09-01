@@ -49,7 +49,7 @@ class EgoObsBuilder:
     field_size: float = 1.5; k_red: int = 8; k_green: int = 4
     ray_deg: tuple = (-90,-60,-30,0,30,60,90); default_dt: float = 0.05
     prev_time: Optional[float]=None; prev_red: Optional[List[Vec2]]=None; prev_green: Optional[List[Vec2]]=None
-
+    flat_dim=134
     def reset(self): self.prev_time=None; self.prev_red=None; self.prev_green=None
 
     def build(self, agent_idx:int, bot_coords:List[Pose], red_coords:List[Vec2], green_coords:List[Vec2],

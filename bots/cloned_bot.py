@@ -53,15 +53,20 @@ class _NNBase:
 @register_bot
 class ClonedBot(_NNBase):
     def __init__(self, agent_idx):
-        super().__init__(agent_idx, "bc_policy.pth")
+        super().__init__(agent_idx, "weights/bc_policy.pth")
 
 @register_bot
 class Dagger(_NNBase):
     def __init__(self, agent_idx):
-        super().__init__(agent_idx, "dagger_policy.pth")
+        super().__init__(agent_idx, "weights/dagger_policy.pth")
+
+@register_bot
+class Dagger1(_NNBase):
+    def __init__(self, agent_idx):
+        super().__init__(agent_idx, "weights/dagger_policy_1.pth")
 
 @register_bot
 class RLBot(_NNBase):
     def __init__(self, agent_idx):
-        super().__init__(agent_idx, "rl_policy.pth")
+        super().__init__(agent_idx, "weights/rl_preview.pth")
 
