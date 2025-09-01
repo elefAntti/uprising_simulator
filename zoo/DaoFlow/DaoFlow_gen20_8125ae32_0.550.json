@@ -1,0 +1,21 @@
+{
+  "candidate": "DaoFlow",
+  "gen": 20,
+  "score": 0.55,
+  "datetime_utc": "20250829T160254Z",
+  "genome": {
+    "attackable_base_score": 12.463772819253386,
+    "defendable_base_score": 3.174455562656049,
+    "attackable_distance_weight": 0.024715680590053732,
+    "defendable_distance_weight": 0.6879753728680891,
+    "attackable_friend_distance_weight": 1.4623321388109982,
+    "defendable_friend_distance_weight": 1.8009021992384766,
+    "attackable_goal_distance_weight": 2.521222114285128,
+    "defendale_goal_distance_weight": 1.1077980380267305,
+    "corner_safety_weight": 4.209333800109344,
+    "corner_safety_scale": 0.12217543308295047,
+    "hysteresis": 0.19643984974178386
+  },
+  "class": "DaoFlow",
+  "name": "DaoFlow@gen20_8125ae32"
+}
