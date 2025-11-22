@@ -56,6 +56,8 @@ if __name__ == "__main__":
     # --- Setup Environment ---
     env = make_vec_env(RobotGameEnv, n_envs=4)
     model = None
+    
+
 
     # --- New: Conditional Model Loading ---
     if args.continue_rl_run:

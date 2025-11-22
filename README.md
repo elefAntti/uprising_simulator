@@ -304,6 +304,31 @@ python log_dagger.py --episodes 200 \
   --out logs_dagger_npz
 ```
 
+## What if we only trained a critic and thepolicy would be a dynamic window optimization using it?
+
+Files
+- utils_obs_canonical.py
+- log_critic_aug.py
+- train_critic_augmented.py
+- bots_critic_mpc_sym.py
+
+### Example, logging
+> python log_critic.py \
+  --out logs_critic_npz \
+  --episodes 500 \
+  --ally AegisPilot \
+  --opponents SimpleBot2 ConeKeeper TerritoryDash AuctionStrider \
+  --agent-idx 0 \
+  --canonical \
+  --augment-reflect \
+  --side-swap
+
+### Example, training
+> python train_critic.py \
+  --data "logs_critic_npz/*.npz" \
+  --out runs/critic_sym \
+  --epochs 12 --batch 4096
+
 
 ---
 ## License
