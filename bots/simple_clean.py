@@ -256,3 +256,93 @@ class PotentialWinner2(PotentialWinnerBase):
     """Potential field controller on *predicted* ball positions."""
     def __init__(self, index: int) -> None:
         super().__init__(index, param=1)
+        
+        
+# ---------------------------------------------------------------------------
+# SimpleBotGrace
+# ---------------------------------------------------------------------------
+@register_bot
+class SimpleBotGrace:
+    """
+    A more advanced controller based on "A Smooth Control Law for Graceful Motion
+    of Differential Wheeled Mobile Robots in 2D environment"
+    Approaches the balls in more clever directions so they are aimed towards the goal
+    """
+    def __init__(self, index: int) -> None:
+        self._index: int = index
+        self._going_to_base: bool = False
+
+    # --- Small strategy helpers -------------------------------------------------
+    def _wait_position(self) -> Tuple[float, float]:
+        """A conservative staging point in our half.
+        Currently symmetric for both teams; feel free to tune.
+        """
+        return (0.4, 1.1)
+
+    def _own_base(self) -> Tuple[float, float]:
+        return get_base_coords(self._index)
+
+    def _opp_base(self) -> Tuple[float, float]:
+        return vec_sub((1.5, 1.5), self._own_base())
+    
+    def steer_to_target(self, own_pos, own_heading, target, target_heading):
+        dx = target[0] - own_pos[0]
+        dy = target[1] - own_pos[1]
+        dir_target = math.atan2(dy, dx)
+        theta = normalize_angle(target_heading - dir_target)
+        delta = normalize_angle(own_heading - dir_target)
+        r = math.hypot(dx,dy)
+        k1 = 1
+        k2 = 15
+        delta_ref = math.atan(-k1 * theta)
+        kappa=-1/r * (k2*(delta-delta_ref) + (1 + k1/(1+k1*k1*theta*theta))*math.sin(delta))
+        wheel_base_half = 0.05
+        max_wheel_vel = 1.0
+        omega = kappa * max_wheel_vel
+        vr = max_wheel_vel + omega * wheel_base_half
+        vl = max_wheel_vel - omega * wheel_base_half
+        max_vel = max(vr,vl)
+        vl = vl / max_vel * max_wheel_vel
+        vr = vr / max_vel * max_wheel_vel
+        return (vl, vr)
+    # --- Main policy ------------------------------------------------------------
+    def get_controls(
+        self,
+        bot_coords: Sequence[Tuple[Tuple[float, float], float]],
+        green_coords: Sequence[Tuple[float, float]],
+        red_coords: Sequence[Tuple[float, float]],
+    ) -> Tuple[float, float]:
+        own_pos = bot_coords[self._index][0]
+        own_heading = bot_coords[self._index][1]
+
+        base = self._own_base()
+        dist_to_base = vec_dist(base, own_pos)
+
+        # Hysteresis: if we're "on our way home", expand the defend zone a bit;
+        # this reduces rapid switching when a ball is near the frontier.
+        defend_margin = 1.0 if self._going_to_base else 0.0
+
+        # Partition balls by whether they lie beyond or inside our base frontier.
+        attackables = [p for p in red_coords if vec_dist(base, p) > dist_to_base]
+        defendables = [p for p in green_coords if vec_dist(base, p) < dist_to_base - defend_margin]
+
+        # Default target is a calm hold position (mirrored to the other diagonal
+        # if the board is empty).
+        target = self._wait_position()
+        if len(red_coords) == 0:
+            target = (target[1], target[0])
+
+        # Choose target + update state flag
+        if red_coords:
+            target = min(red_coords, key=vec_distTo(own_pos))
+            self._going_to_base = False
+        elif green_coords:
+            target = min(green_coords, key=vec_distTo(own_pos))
+            self._going_to_base = True
+        else:
+            self._going_to_base = True
+
+        target_base = self._own_base() if self._going_to_base else self._opp_base() 
+        target_heading = vec_angle(vec_sub(target_base, target))
+        # Convert target into differential wheel commands.
+        return self.steer_to_target(own_pos, own_heading, target, target_heading)
